@@ -105,3 +105,18 @@ def test_hard_split_small_budget() -> None:
     chunks = chunk.chunk_text(quote(text), 200)
     assert len(chunks) >= 3
     assert "".join(unquote(ln) for c in chunks for ln in c.split("\n") if ln.strip()) == text
+
+
+def test_hard_split_continuation_uses_original_budget() -> None:
+    # 旧脚本 hard_split 的续段预算 room = budget - 32 读的是模块级全局（首次的原始
+    # budget），重切 pass 传 budget-64 不改变续段 room——移植必须复刻，否则 T4 逐字
+    # 节对拍失败（2026-10-15 M1 验收实证：旧 [48,11933,11969,11969,9137]）。期望值
+    # 取自旧脚本 heredoc python 原样执行的输出。
+    full = build_full("汉" * 15000)
+    rechunked = chunk.chunk_text(full, 11936, hard_budget=12000)  # 重切 pass 实参
+    naive = chunk.chunk_text(full, 11936)  # 续段预算跟随本参（错误语义，作对照）
+    assert [chunk.byte_len(c) for c in rechunked] == [48, 11933, 11969, 11969, 9137]
+    assert [chunk.byte_len(c) for c in naive] == [48, 11933, 11906, 11906, 9263]
+    # 端到端：split_notify_chunks 含「（续 i/n）」标记后的整链路尺寸
+    chunks = chunk.split_notify_chunks(full, 12000)
+    assert [chunk.byte_len(c) for c in chunks] == [48, 11948, 11984, 11984, 9152]

@@ -22,9 +22,11 @@ def _fence_marker(line: str) -> str | None:
     return s if s.startswith("```") else None
 
 
-def _hard_split(line: str, room: int, prefix: str, budget: int) -> list[str] | None:
+def _hard_split(line: str, room: int, prefix: str, hard_budget: int) -> list[str] | None:
     """超长行按 UTF-8 字符边界硬切：首段进 room 字节，续段补 prefix。
 
+    续段预算用 hard_budget - 32：旧脚本的续段 room 读模块级全局 budget（原始
+    预算），不随 chunk_text 本次调用的（可能已缩减的）budget 变化，移植须复刻。
     返回 None 表示预算小到放不下一个字符，由调用方兜底。
     """
     pieces: list[str] = []
@@ -40,14 +42,19 @@ def _hard_split(line: str, room: int, prefix: str, budget: int) -> list[str] | N
         pieces.append(piece if first else prefix + piece)
         first = False
         data = data[cut:]
-        room = budget - 32  # 续段预算：留出 prefix、换行、围栏重开头和片尾闭合的余量
+        room = hard_budget - 32  # 续段预算：留出 prefix、换行、围栏重开头和片尾闭合的余量
     piece = data.decode("utf-8", "replace")
     pieces.append(piece if first else prefix + piece)
     return pieces
 
 
-def chunk_text(text: str, budget: int) -> list[str]:
-    """尽量切在空行/换行处；切点落在代码围栏中间时片尾补闭合、下片重开。"""
+def chunk_text(text: str, budget: int, *, hard_budget: int | None = None) -> list[str]:
+    """尽量切在空行/换行处；切点落在代码围栏中间时片尾补闭合、下片重开。
+
+    hard_budget 缺省为 budget；多片重切时调用方传原始 budget（见 split_notify_chunks）。
+    """
+    if hard_budget is None:
+        hard_budget = budget
     chunks: list[str] = []
     cur: list[str] = []
     cur_b = 0
@@ -93,7 +100,7 @@ def chunk_text(text: str, budget: int) -> list[str]:
         # 单行自身就超预算：按 UTF-8 边界硬切。
         # 围栏标记行不可能是超长行，所以围栏状态在行内不会变化。
         prefix = "" if fence_open else "> "
-        pieces = _hard_split(line, budget - cur_b - reserve - 1, prefix, budget)
+        pieces = _hard_split(line, budget - cur_b - reserve - 1, prefix, hard_budget)
         if pieces is None:
             pieces = [line]  # 极端小预算兜底，允许单片略超
         for piece in pieces:
@@ -111,7 +118,8 @@ def split_notify_chunks(full: str, budget: int) -> list[str]:
     """分片并给第 2 片起加「（续 i/n）」标记：多片时预留标记空间后重切。"""
     chunks = chunk_text(full, budget)
     if len(chunks) > 1:
-        # 预留「（续 i/n）」标记的空间后重切，确保加标记后仍不超预算
-        chunks = chunk_text(full, budget - 64)
+        # 预留「（续 i/n）」标记的空间后重切，确保加标记后仍不超预算；
+        # hard_budget 传原始 budget：旧脚本续段 room 读全局（原始）预算，不随 -64 缩减
+        chunks = chunk_text(full, budget - 64, hard_budget=budget)
         chunks[1:] = [f"（续 {i + 2}/{len(chunks)}）\n\n" + c for i, c in enumerate(chunks[1:])]
     return chunks
