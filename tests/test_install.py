@@ -29,6 +29,38 @@ def test_extract_old_lark_uid(tmp_path: Path) -> None:
     assert install.extract_old_lark_uid(s) is None
 
 
+def test_extract_old_lark_uid_bare_uid_var(tmp_path: Path) -> None:
+    # 实际下发的旧脚本变量名是 UID=（无 LARK_ 前缀），也得能提取
+    s = tmp_path / "notify_feishu.sh"
+    s.write_text("#!/bin/sh\n\nUID=ou_bare789\n", encoding="utf-8")
+    assert install.extract_old_lark_uid(s) == "ou_bare789"
+
+
+def test_extract_old_lark_uid_prefers_lark_var(tmp_path: Path) -> None:
+    # 裸 UID= 可能是 shell 数字 uid 等无关赋值：两种共存时 LARK_UID 优先
+    s = tmp_path / "notify_feishu.sh"
+    s.write_text("#!/bin/sh\nUID=1000\nLARK_UID=ou_real\n", encoding="utf-8")
+    assert install.extract_old_lark_uid(s) == "ou_real"
+
+
+def test_extract_old_lark_uid_strips_quotes(tmp_path: Path) -> None:
+    s = tmp_path / "notify_feishu.sh"
+    s.write_text('#!/bin/sh\nUID="ou_quoted"\n', encoding="utf-8")
+    assert install.extract_old_lark_uid(s) == "ou_quoted"
+
+
+def test_extract_old_lark_uid_rejects_non_open_id(tmp_path: Path) -> None:
+    # 非 ou_ 开头的合法 open_id 形状一律拒绝（数字 uid、粘注释、变量引用），
+    # 让 install 走「请手工填写」路径而非迁移错值
+    s = tmp_path / "notify_feishu.sh"
+    s.write_text("#!/bin/sh\nUID=1000\n", encoding="utf-8")
+    assert install.extract_old_lark_uid(s) is None
+    s.write_text("#!/bin/sh\nUID=ou_x#note\n", encoding="utf-8")
+    assert install.extract_old_lark_uid(s) is None
+    s.write_text("#!/bin/sh\nUID=$USER_ID\n", encoding="utf-8")
+    assert install.extract_old_lark_uid(s) is None
+
+
 def test_default_config_text() -> None:
     text = install.default_config_text("ou_x")
     assert 'lark_uid = "ou_x"' in text

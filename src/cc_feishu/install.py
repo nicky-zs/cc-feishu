@@ -14,7 +14,11 @@ from typing import Any
 from cc_feishu import config
 
 NOTIFY_COMMAND = "cc-feishu notify"
-_UID_RE = re.compile(r"^LARK_UID=(\S+)", re.MULTILINE)
+# 依次尝试：LARK_UID= 优先（裸 UID= 可能是 shell 数字 uid 等无关赋值）
+_UID_RES = tuple(
+    re.compile(rf"^{name}=(\S+)", re.MULTILINE) for name in ("LARK_UID", "UID")
+)
+_OPEN_ID_RE = re.compile(r"ou_\w+")
 
 
 def old_script_path() -> Path:
@@ -22,13 +26,22 @@ def old_script_path() -> Path:
 
 
 def extract_old_lark_uid(old_script: Path) -> str | None:
-    """从旧脚本提取 LARK_UID（M1 迁移期一次性使用）。"""
+    """从旧脚本提取通知接收人 open_id（M1 迁移期一次性使用）。
+
+    兼容 LARK_UID= 与裸 UID= 两种赋值（实际下发的旧脚本用后者），剥两端引号；
+    只接受 ou_ 开头的合法 open_id 形状，否则返回 None 走手工填写路径。
+    """
     try:
         text = old_script.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    m = _UID_RE.search(text)
-    return m.group(1) if m else None
+    for rx in _UID_RES:
+        m = rx.search(text)
+        if m:
+            v = m.group(1).strip("\"'")
+            if _OPEN_ID_RE.fullmatch(v):
+                return v
+    return None
 
 
 def default_config_text(lark_uid: str) -> str:
