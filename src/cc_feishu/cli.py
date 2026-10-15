@@ -4,7 +4,7 @@ import argparse
 import os
 import sys
 
-from cc_feishu import notify
+from cc_feishu import install, notify
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -13,12 +13,15 @@ def main(argv: list[str] | None = None) -> int:
 
     p_notify = sub.add_parser("notify", help="Notification hook 入口")
     p_notify.add_argument("--dry-run", action="store_true", help="只打印分片与字节数，不发送")
+    sub.add_parser("install", help="注册 Notification hook 并生成默认配置（幂等）")
 
     args = parser.parse_args(argv)
 
     if args.command == "notify":
         dry_run = args.dry_run or os.environ.get("DRY_RUN") == "1"
         return notify.notify(sys.stdin.read(), dry_run)
+    if args.command == "install":
+        return install.run_install()
 
     parser.print_help()
     return 0
