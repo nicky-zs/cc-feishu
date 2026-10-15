@@ -35,7 +35,7 @@ def default_config_text(lark_uid: str) -> str:
     return f"""# cc-feishu 配置（cc-feishu install 生成）
 lark_uid = "{lark_uid}"      # 通知接收人
 chunk_bytes = 12000        # 单片字节预算
-from_label = ""            # 通知头 from 行标签，缺省用 hostname
+from_label = ""            # 通知头 from 行机器标签，缺省 hostname；行尾自动附会话短 ID
 delivery = "tmux"          # 默认交付后端：tmux | queue（M2 生效）
 resume_prefix = "/go"      # resume 显式触发前缀（M3 生效）
 routing_ttl_hours = 24     # 路由表条目过期时间（M2 生效）

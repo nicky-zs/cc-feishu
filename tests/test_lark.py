@@ -60,6 +60,17 @@ def test_send_markdown_cli_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "lark-cli not found" in err
 
 
+def test_send_markdown_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    # lark-cli 挂起不得无限阻塞 Notification hook：超时按失败处理
+    def raise_timeout(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd, 30)
+
+    monkeypatch.setattr(lark.subprocess, "run", raise_timeout)
+    ok, err = lark.send_markdown("ou_x", "文本")
+    assert not ok
+    assert "超时" in err
+
+
 def test_send_chunks_throttle_and_isolated_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeRun(fail_on="第二片")
     monkeypatch.setattr(lark.subprocess, "run", fake.run)

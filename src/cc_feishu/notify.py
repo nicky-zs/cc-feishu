@@ -2,18 +2,33 @@
 
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 from cc_feishu import chunk, config, lark, transcript
 
 
+def _session_hint(hook: dict[str, Any]) -> str:
+    """会话短 ID：优先 hook stdin 的 session_id，回退 transcript 文件名（M2 路由同源）。"""
+    sid = hook.get("session_id")
+    if isinstance(sid, str) and sid:
+        return sid[:8]
+    tp = hook.get("transcript_path")
+    if isinstance(tp, str) and tp:
+        return Path(tp).stem[:8]
+    return ""
+
+
 def build_notification(hook: dict[str, Any], last_msg: str, from_label: str) -> str:
-    """通知头 + 引用化正文。头格式与旧脚本逐字节一致。"""
+    """通知头 + 引用化正文。from 行 = 机器标签（缺省 hostname）+ 会话短 ID。"""
     message = hook.get("message")
     cwd = hook.get("cwd")
     header = "# " + (message if isinstance(message, str) and message else "等待输入")
     header += "\n\n- `" + (cwd if isinstance(cwd, str) else "") + "`"
     header += "\n\nfrom: " + from_label
+    hint = _session_hint(hook)
+    if hint:
+        header += " (" + hint + ")"
     if last_msg:
         return header + "\n\n" + "> " + "\n> ".join(last_msg.split("\n"))
     return header

@@ -7,15 +7,18 @@ import time
 SEND_CMD = ["lark-cli", "im", "+messages-send", "--as", "bot"]
 ERR_TRUNCATE = 500
 CHUNK_INTERVAL = 0.3  # 片间限速，避免触发消息发送频率限制
+SEND_TIMEOUT = 30.0  # 单片发送超时：lark-cli 挂起不得无限阻塞 Notification hook
 
 
 def send_markdown(uid: str, markdown: str) -> tuple[bool, str]:
     """发一条 markdown 消息给 uid。返回 (成功, 错误信息截断)。"""
     cmd = [*SEND_CMD, "--user-id", uid, "--markdown", markdown]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=SEND_TIMEOUT)
     except FileNotFoundError:
         return False, "lark-cli not found"
+    except subprocess.TimeoutExpired:
+        return False, f"lark-cli 发送超时（>{int(SEND_TIMEOUT)}s）"
     if p.returncode == 0:
         return True, ""
     return False, (p.stderr or p.stdout or "").strip()[:ERR_TRUNCATE]

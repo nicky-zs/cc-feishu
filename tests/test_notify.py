@@ -101,6 +101,30 @@ def test_quote_body() -> None:
     assert full.endswith("> 第一行\n> \n> 第二行")
 
 
+def test_from_line_includes_session_hint() -> None:
+    # from 行 = 机器标签 + 会话短 ID（跨机器/多会话辨识等待来源）
+    full = notify.build_notification(
+        {"message": "m", "cwd": "/w", "session_id": "30864079-135b-4329-a169-7299c127ae0b"},
+        "",
+        "host1",
+    )
+    assert full.endswith("from: host1 (30864079)")
+
+
+def test_from_line_session_from_transcript_fallback() -> None:
+    # 无 session_id 时回退 transcript 文件名（与 M2 路由表取 session_id 同源）
+    full = notify.build_notification(
+        {"message": "m", "cwd": "/w", "transcript_path": "/p/abc12345-dead-beef.jsonl"}, "", "host1"
+    )
+    assert full.endswith("from: host1 (abc12345)")
+
+
+def test_from_line_without_session() -> None:
+    # 两个来源都没有：from 行保持纯机器标签
+    full = notify.build_notification({"message": "m", "cwd": "/w"}, "", "host1")
+    assert full.endswith("from: host1")
+
+
 def test_large_body_ok() -> None:
     # 数百 KB 正文：进程内直调不崩、分片正确（argv 上限不复存在）
     big = "汉字内容测试" * 20000  # ~420KB
