@@ -14,7 +14,8 @@ M2（listen + 路由表 + tmux 后端）待启动——一周至一月后，先�
 ## Agent 安装指引
 
 > 本节写给 AI Agent（Claude Code 等）。你的用户要求你在这台机器上安装并配置 cc-feishu。
-> 按序执行；每步有明确判据。**步骤 3 需要用户人工参与（飞书后台建应用），到那一步停下来问。**
+> 按序执行；每步有明确判据。**步骤 3 由你驱动流程、用户只在手机/浏览器里操作——
+> 到那一步把「用户操作」清单原样转述给用户，等用户说完成后继续。**
 
 前置认知：
 - cc-feishu 是 CLI + Claude Code Notification hook（不是 skill）；hook 把 Claude 等待人工输入时的
@@ -27,10 +28,11 @@ M2（listen + 路由表 + tmux 后端）待启动——一周至一月后，先�
 ```bash
 pipx install git+https://github.com/nicky-zs/cc-feishu.git
 cc-feishu --help        # 期望：输出 {notify,install} 子命令帮助
+lark-cli --version || npm install -g @larksuite/cli   # 飞书执行层（npm 源不可达时问用户）
 ```
 
-判据：`cc-feishu --help` 退出码 0。pipx 不存在则先装 pipx（`python3 -m pip install --user pipx`
-或发行版包管理器）。Python < 3.11 时先升级。
+判据：`cc-feishu --help` 与 `lark-cli --version` 都退出码 0。pipx 不存在则先装 pipx
+（`python3 -m pip install --user pipx` 或发行版包管理器）。Python < 3.11 时先升级。
 
 ### 2. 集成到 Claude Code（自动）
 
@@ -44,21 +46,44 @@ cc-feishu install
 
 判据：命令退出码 0；`grep cc-feishu ~/.claude/settings.json` 命中。
 
-### 3. 配置飞书应用（⛔ 人工，停下问用户）
+### 3. 配置飞书应用（Agent 驱动，用户手机/浏览器操作）
 
-cc-feishu 通过 lark-cli 调飞书 OpenAPI，lark-cli 需要一个**用户自己的飞书自建应用**：
+cc-feishu 通过 lark-cli 调飞书 OpenAPI，需要**用户自己的飞书自建应用**（bot 身份发
+消息 + user 身份查 open_id）。应用配置流程官方就是为 Agent 设计的：你后台发起、
+转发链接与二维码、等用户在浏览器完成。
 
-1. [飞书开放平台](https://open.feishu.cn) → 开发者后台 → 创建企业自建应用
-2. 开通权限：`im:message:send_as_bot`（以 bot 身份发消息；界面名可能显示为
-   「以应用的身份发消息」）。M2 反向通道需额外 `im:message.p2p_msg:readonly` 与
-   事件订阅 `im.message.receive_v1`，M1 阶段可以先不开
-3. 发布应用版本（权限变更需发版生效）
-4. 把应用的 App ID / App Secret 配置到 lark-cli：
-   `lark-cli auth login`（交互式，跟随提示；`lark-cli auth status` 验证，期望 bot 状态 ready）
-5. 在飞书客户端给该应用发一条消息（开通会话，否则 bot 无法主动私发用户）
+**3a. 应用配置**（后台运行，阻塞至用户完成；从输出提取 URL）：
 
-**这五小步是平台侧流程，Agent 无法代办**（需要用户登录开发者后台与飞书客户端）。
-向用户说明上面 1–5 并等完成后继续。
+```bash
+lark-cli config init --new          # 创建新应用；已有应用见备注
+lark-cli auth qrcode "<url>" --output auth-qr.png   # 二维码必须与链接一起展示给用户
+```
+
+**用户操作**（把下面清单原样转述给用户，等用户说完成后继续）：
+1. 扫二维码（或浏览器打开链接）登录飞书开放平台，按引导创建企业自建应用
+2. 应用后台「权限管理」开通 `im:message:send_as_bot`（界面名「以应用的身份发消息」）；
+   M2 反向通道届时再加 `im:message.p2p_msg:readonly` 与事件订阅 `im.message.receive_v1`
+3. 「版本管理与发布」创建版本并发布（权限变更需发版生效）
+4. 飞书客户端搜索应用名，给它发一条消息（不开天窗 bot 无法主动私发用户）
+
+> 备注：用户已有应用时改用非交互方式：`lark-cli config init --app-id <id> --app-secret-stdin`
+> （Secret 从 stdin 传入，避免进进程列表）。
+
+**3b. 用户身份授权**（查本人 open_id 用；同样链接 + 二维码流程）：
+
+```bash
+lark-cli auth login --no-wait --json
+lark-cli auth qrcode "<url>" --output login-qr.png   # 同样转述给用户、等待完成
+```
+
+**3c. 验证**（Agent 执行）：
+
+```bash
+lark-cli auth status --json --verify
+# 期望：identities.bot.status == ready 且 identities.user.status == ready
+```
+
+bot 缺 scope 时 lark-cli 报错通常带 `console_url`——直接把该链接转给用户去后台开通。
 
 ### 4. 填 lark_uid（自动）
 
@@ -94,6 +119,7 @@ printf '{"message":"cc-feishu 安装自检","cwd":"'"$PWD"'"}' | cc-feishu notif
 | 症状 | 原因 → 处理 |
 |---|---|
 | notify 后 stderr「配置缺 lark_uid」 | 步骤 4 未完成 |
-| 「lark-cli not found」/ 调用失败 | 步骤 3 的 lark-cli 未安装或未 auth |
-| lark-cli 成功但用户没收到 | 步骤 3-5 未做（未给应用发过消息开天窗）/ uid 不是本人 / 用户看错会话 |
+| 「lark-cli not found」/ 调用失败 | 步骤 1 的 lark-cli 未装，或步骤 3a 的 `config init` 未完成 |
+| bot 发送报缺 scope | 把报错里的 `console_url` 转给用户，去开发者后台开通并发版 |
+| lark-cli 成功但用户没收到 | 步骤 3 用户操作 4 未做（未给应用发消息开天窗）/ uid 不是本人 / 看错会话 |
 | 多片消息只见部分 | 个别片失败会记 stderr 不中断，检查频率限制（chunk_bytes 可调小） |
