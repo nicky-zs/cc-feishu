@@ -60,6 +60,22 @@ def test_patch_settings_idempotent(tmp_path: Path) -> None:
     assert install.patch_settings(p) is False  # 已是目标状态 → 无改动
 
 
+def test_patch_settings_idempotent_with_args(tmp_path: Path) -> None:
+    # 命令带额外参数（如手工加的 --dry-run）也算已安装，不得重复注册
+    p = write_settings(
+        tmp_path,
+        {
+            "hooks": {
+                "Notification": [
+                    {"hooks": [{"type": "command", "command": "cc-feishu notify --dry-run"}]}
+                ]
+            }
+        },
+    )
+    assert install.patch_settings(p) is False
+    assert notification_commands(p) == ["cc-feishu notify --dry-run"]
+
+
 def test_patch_settings_appends_when_absent(tmp_path: Path) -> None:
     p = write_settings(tmp_path, {"model": "x"})
     assert install.patch_settings(p) is True
@@ -75,9 +91,13 @@ def test_patch_settings_creates_missing(tmp_path: Path) -> None:
 
 
 def test_patch_settings_malformed(tmp_path: Path) -> None:
+    # 损坏的 settings.json：重建可用的最小配置，但原件先备份（Review Focus #6：不丢数据）
     p = write_settings(tmp_path, "{broken json")
     assert install.patch_settings(p) is True
     assert notification_commands(p) == ["cc-feishu notify"]
+    backups = sorted(tmp_path.glob("settings.json.broken-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "{broken json"
 
 
 def test_patch_settings_preserves_other_hooks(tmp_path: Path) -> None:

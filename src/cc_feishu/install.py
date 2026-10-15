@@ -6,6 +6,8 @@ M2 上线 listen daemon 时再补装 systemd user unit；M1 只做 hook 与配�
 import json
 import os
 import re
+import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -54,16 +56,36 @@ def _atomic_write(path: Path, data: str) -> None:
     tmp.replace(path)
 
 
+def _is_installed(cmd: str) -> bool:
+    """命令是否为已安装的 notify hook：前缀匹配，兼容手工附加参数（--dry-run 等）。"""
+    return cmd == NOTIFY_COMMAND or cmd.startswith(NOTIFY_COMMAND + " ")
+
+
+def _backup_malformed(path: Path) -> None:
+    """损坏的 settings.json 先备份再重建，用户手工修复有余地（Review Focus #6：不丢数据）。"""
+    if not path.is_file():
+        return
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.broken-{ts}")
+    try:
+        shutil.copy2(path, backup)
+    except OSError:
+        pass  # 备份失败不阻断重建：损坏的配置本来已不可用
+
+
 def patch_settings(path: Path) -> bool:
     """把 Notification hooks 里的 notify_feishu.sh 替换为 cc-feishu notify；没有则新增。
 
     幂等：已是目标状态返回 False。其他 hook 一律保留。
+    损坏的 settings.json：原件备份为 settings.json.broken-<ts> 后重建最小可用配置。
     """
     data: dict[str, Any] = {}
-    try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        parsed = None
+    parsed: object = None
+    if path.is_file():
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _backup_malformed(path)
     if isinstance(parsed, dict):
         data = parsed
     hooks = data.get("hooks")
@@ -92,7 +114,7 @@ def patch_settings(path: Path) -> bool:
                     h["command"] = NOTIFY_COMMAND
                     changed = True
                 installed = True
-            elif cmd.strip() == NOTIFY_COMMAND:
+            elif _is_installed(cmd.strip()):
                 installed = True
     if not installed:
         notif.append({"hooks": [{"type": "command", "command": NOTIFY_COMMAND}]})
