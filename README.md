@@ -7,4 +7,5 @@ Claude Code ↔ 飞书桥：等待人工响应时把生成内容分片发送到�
 - Python ≥ 3.11，零运行时依赖，mypy strict
 - 安装：`pipx install git+<repo>` → `cc-feishu install`
 
-状态：设计已确认，M1（现有通知功能的严格类型迁移）待实现。
+状态：M1 完成（通知链路已迁移并通过逐字节比对验收，旧 notify_feishu.sh 已退役）。
+M2（listen + 路由表 + tmux 后端）待启动。
