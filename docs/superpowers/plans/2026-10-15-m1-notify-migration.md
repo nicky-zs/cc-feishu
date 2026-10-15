@@ -16,11 +16,12 @@
 - **mypy strict = true 全绿**（`mypy src`）+ `ruff check .` + `ruff format .` 是每次提交门槛
 - pytest 测试通过 `pythonpath = ["src"]` 直接跑 src，无需安装
 - 现有 bash 套件 T1–T7 的 **18 项断言全部迁入** pytest（断言文本保持等价）
-- M1 行为不变：新旧链路 DRY_RUN 输出**逐字节一致**。仅允许四个明确记录的差异：
+- M1 行为不变：新旧链路 DRY_RUN 输出**逐字节一致**（含元数据条目的真实 transcript 除外，见差异 5）。仅允许五个明确记录的差异：
   1. `from:` 行默认用 hostname（旧脚本硬编码 `10.123.179.32`；比对验收时用 `from_label` 配置对齐）
   2. hook stdin 非法 JSON 时降级为基础通知并退出 0（旧链路 python 直接崩）
   3. `FEISHU_CHUNK_BYTES` 非整数值时忽略（旧链路崩溃）
   4. transcript jsonl 中的空行跳过而非毒化整体结果（旧链路 jq 遇空行报错、只发基础通知）
+  5. **提取重置规则收紧**（设计文档 0fe935f 修订，第三次线上 bug 修复）：重置只认 `user` 条目；`assistant` 主链条目追加；**其余一切**（sidechain assistant 及 `last-prompt`/`ai-title`/`mode`/`permission-mode`/`atis-latch`/`attachment`/`system`/`file-history-*`/`cost-state` 等元数据）一律忽略。旧 jq「非 assistant 即重置」会被 turn 结束后追加的元数据把正文清空（通知只剩头部）。等价关系：`新语义(raw) == 旧语义(过滤掉全部被忽略条目后的 raw)`——验收比对据此构造旧侧基线（Task 8）
 - 通知是 best-effort：发送失败只记 stderr，**hook 退出码恒 0**
 - 配置键名与默认值 verbatim 依设计 §4：`lark_uid`（默认 `""`）、`chunk_bytes = 12000`、`from_label`（默认 `""`）、`delivery = "tmux"`、`resume_prefix = "/go"`、`routing_ttl_hours = 24`；路径 `~/.config/cc-feishu/config.toml`
 - 环境变量：`CC_FEISHU_CONFIG` 覆盖配置路径（测试用）；`FEISHU_CHUNK_BYTES` 覆盖单片预算（与旧脚本同名同义）；`DRY_RUN=1` 等价 `--dry-run`；`CLAUDE_CONFIG_DIR` 覆盖 settings.json 位置（install 用）
@@ -30,13 +31,14 @@
 
 ## Review Focus
 
-以下五类输入是设计文档未显式覆盖、但最可能坑到使用者的场景（已逐条落实到所属任务的测试）：
+以下六类输入是设计文档未显式覆盖（或刚由 0fe935f 补充）、但最可能坑到使用者的场景（已逐条落实到所属任务的测试）：
 
-1. **transcript 尾部半行**（Claude Code 正在写入时触发 hook）：旧链路 jq 全有或全无——任一行坏则整体返回空、发基础通知，绝不能输出半截内容 → Task 3 `test_malformed_line_returns_empty` + `test_partial_content_never_leaks`
-2. **AskUserQuestion 选项 description 空串 vs 缺失**（jq 真值语义：空串也是真）：`""` 要产出 `"- 选项一："`（带冒号），缺失则不带 → Task 3 `test_option_description_empty_vs_missing`
-3. **hook stdin 非法 JSON**：降级为基础通知、退出 0，不能崩（已记录的与旧链路差异）→ Task 6 `test_cli_invalid_stdin_json_degrades`
-4. **极小/垃圾 chunk_bytes**：floor 到 1000；小预算硬切不崩、UTF-8 边界安全、内容可精确还原（hard_split 返回 None 的兜底分支为旧脚本原样保留的防御代码，实践中不可达）→ Task 2 `test_hard_split_small_budget` + Task 4 `test_chunk_bytes_floor`
-5. **settings.json 缺失/损坏/Notification 里并存其他 hook**：install 不丢数据、不重复注册、幂等 → Task 7 `test_patch_settings_creates_missing` / `test_patch_settings_malformed` / `test_patch_settings_preserves_other_hooks`
+1. **turn 结束后追加的元数据条目**（第三次线上 bug，设计 0fe935f）：`last-prompt`/`ai-title`/`mode`/`attachment` 等出现在最后一段 assistant 内容之后时，正文必须保留（旧 jq 会清空只剩头部）；元数据夹在两轮之间且有 user 边界时，新旧语义等价 → Task 3 `test_trailing_metadata_preserves_content` + `test_metadata_between_turns_same_as_old`
+2. **transcript 尾部半行**（Claude Code 正在写入时触发 hook）：旧链路 jq 全有或全无——任一行坏则整体返回空、发基础通知，绝不能输出半截内容 → Task 3 `test_malformed_line_returns_empty` + `test_partial_content_never_leaks`
+3. **AskUserQuestion 选项 description 空串 vs 缺失**（jq 真值语义：空串也是真）：`""` 要产出 `"- 选项一："`（带冒号），缺失则不带 → Task 3 `test_option_description_empty_vs_missing`
+4. **hook stdin 非法 JSON**：降级为基础通知、退出 0，不能崩（已记录的与旧链路差异）→ Task 6 `test_cli_invalid_stdin_json_degrades`
+5. **极小/垃圾 chunk_bytes**：floor 到 1000；小预算硬切不崩、UTF-8 边界安全、内容可精确还原（hard_split 返回 None 的兜底分支为旧脚本原样保留的防御代码，实践中不可达）→ Task 2 `test_hard_split_small_budget` + Task 4 `test_chunk_bytes_floor`
+6. **settings.json 缺失/损坏/Notification 里并存其他 hook**：install 不丢数据、不重复注册、幂等 → Task 7 `test_patch_settings_creates_missing` / `test_patch_settings_malformed` / `test_patch_settings_preserves_other_hooks`
 
 另有两条也已在任务内固化：单片发送失败不中断其余片（Task 6 `test_send_failure_isolated`）；数百 KB 正文不经 argv 传递、不崩（Task 6 `test_large_body_ok`，进程内直调）。
 
@@ -458,7 +460,6 @@ git add src/cc_feishu/chunk.py tests/test_chunk.py
 git commit -m "feat(chunk): 分片纯函数迁移（T2/T3/T4 断言 + 硬切兜底）"
 ```
 
-
 ### Task 3: transcript.py 提取最后一段连续 assistant 内容
 
 **Files:**
@@ -470,20 +471,27 @@ git commit -m "feat(chunk): 分片纯函数迁移（T2/T3/T4 断言 + 硬切兜�
 - Produces:
   - `transcript.extract_last_assistant(transcript_path: str | Path) -> str` — 读 jsonl 末 100 行（与旧脚本 `tail -n 100` 等价），返回最后一段连续主链 assistant 内容合并文本；文件不存在/空/任一行坏 JSON 时返回 `""`
 
-**jq 语义对照**（迁移必须逐条对齐，jq 真值规则：只有 `false`/`null` 为假，`""` 为真）：
+**条目类型处理规则**（设计文档 0fe935f 修订版——第三次线上 bug 修复，勿改动语义）：
 
-| 旧 jq 行为 | Python 迁移 |
-|---|---|
-| `reduce`：主链 assistant（`type=="assistant"` 且 `isSidechain != true`）追加，**其余任何条目（含 sidechain assistant）重置** | `if _is_main_assistant(e): … else: texts = []` |
-| `map(select(length>0))`：空内容条目被过滤但**不重置**，也不产生分隔符 | `if t: texts.append(t)` |
-| `if $x.header`：`""` 为真 → `"** ** "` | `isinstance(header, str)`（不做真值判断） |
-| `if .description`：`""` 为真 → `"："` 结尾 | `isinstance(desc, str)` → 带 `"："`；键缺失 → 不带 |
-| jq 解析错误（坏行）→ 整体输出空 | `except ValueError: return ""` |
-| blocks 中非 text/AskUserQuestion → `empty`（不进列表） | 只 append 匹配块 |
+| 条目 | 处理 | 备注 |
+|---|---|---|
+| `type == "assistant"` 且 `isSidechain != true`（主链） | **追加**其格式化内容 | 空内容条目过滤但不重置 |
+| `type == "user"`（用户输入 / tool_result） | **重置** | 真正的对话边界 |
+| **其余一切**（sidechain assistant；`last-prompt`/`ai-title`/`agent-name`/`custom-title`/`mode`/`permission-mode`/`atis-latch`/`attachment`/`system`/`file-history-*`/`cost-state` 等元数据） | **忽略**（不追加不重置） | 旧 jq「非 assistant 即重置」会被 turn 末尾元数据清空正文 |
+
+sidechain assistant 归入「忽略」是本计划的决定（设计未点名）：保留旧脚本「侧链内容不进通知」的意图，同时不让它成为重置边界。与旧链路的等价关系：`新语义(raw) == 旧语义(raw 过滤掉全部被忽略条目)`。
+
+块级格式（自旧 jq 迁移，jq 真值规则：只有 `false`/`null` 为假，`""` 为真）：
+
+- content 为字符串（老格式）→ 原样
+- `text` 块 → `.text` 原样
+- `AskUserQuestion` tool_use → `**标题** 问题（可多选）` + `- 标签：描述` 选项列表
+- 其他块（thinking/其他 tool_use）→ 不进列表（jq `empty`）
+- `if $x.header`：`""` 为真 → `"** ** "`；`if .description`：`""` 为真 → 带 `"："`，键缺失 → 不带
 
 - [ ] **Step 1: 写失败测试**
 
-`tests/test_transcript.py`（T6/T7 断言的函数级迁移 + review focus #1/#2）：
+`tests/test_transcript.py`（T6/T7 断言的函数级迁移 + review focus #1/#2/#3）：
 
 ```python
 import json
@@ -519,6 +527,11 @@ def sidechain_entry(text: str) -> str:
         ensure_ascii=False)
 
 
+def meta_entry(mtype: str) -> str:
+    """turn 结束后 transcript 追加的元数据条目（第三次线上 bug 的元凶）。"""
+    return json.dumps({"type": mtype, "value": "whatever"}, ensure_ascii=False)
+
+
 def write(tmp_path: Path, lines: list[str]) -> Path:
     p = tmp_path / "t.jsonl"
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -540,7 +553,7 @@ def test_malformed_line_returns_empty(tmp_path: Path) -> None:
 
 
 def test_partial_content_never_leaks(tmp_path: Path) -> None:
-    # 半行（Claude 正在写入时触发 hook）：join 前被截断的内容不能泄漏（review focus #1）
+    # 半行（Claude 正在写入时触发 hook）：join 前被截断的内容不能泄漏
     p = tmp_path / "t.jsonl"
     p.write_text(assistant_entry("完整行") + '\n{"type":"assistant","isSidechain":false,', encoding="utf-8")
     assert transcript.extract_last_assistant(p) == ""
@@ -586,11 +599,48 @@ def test_boundary_reset(tmp_path: Path) -> None:  # T7 场景（2 断言）
     ])
     out = transcript.extract_last_assistant(p)
     assert "本轮的说明文字" in out and "**测试** T7 的问题？" in out  # T7 本轮文本+问题都在
-    assert "上一轮的陈旧文本" not in out  # T7 旧轮文本被边界重置
+    assert "上一轮的陈旧文本" not in out  # T7 旧轮文本被 user 边界重置
+
+
+def test_trailing_metadata_preserves_content(tmp_path: Path) -> None:
+    # 第三次线上 bug（设计 0fe935f）：turn 结束后追加的元数据不得清空正文
+    p = write(tmp_path, [
+        user_entry(),
+        assistant_entry("本轮生成的主要内容。"),
+        meta_entry("last-prompt"),
+        meta_entry("ai-title"),
+        meta_entry("mode"),
+        meta_entry("permission-mode"),
+        meta_entry("atis-latch"),
+        meta_entry("attachment"),
+        meta_entry("system"),
+        meta_entry("file-history-snapshot"),
+        meta_entry("cost-state"),
+    ])
+    assert transcript.extract_last_assistant(p) == "本轮生成的主要内容。"
+
+
+def test_metadata_between_turns_same_as_old(tmp_path: Path) -> None:
+    # 元数据夹在两轮之间且随后有 user 边界：新旧语义等价（都只剩本轮）
+    p = write(tmp_path, [
+        assistant_entry("上一轮内容"),
+        meta_entry("last-prompt"),
+        meta_entry("ai-title"),
+        user_entry(),
+        assistant_entry("本轮内容"),
+        meta_entry("mode"),
+    ])
+    assert transcript.extract_last_assistant(p) == "本轮内容"
+
+
+def test_only_metadata_returns_empty(tmp_path: Path) -> None:
+    # 尾部 100 行只有元数据（真实 case：dee558e2 transcript）：发基础通知
+    p = write(tmp_path, [meta_entry("last-prompt"), meta_entry("mode"), meta_entry("system")])
+    assert transcript.extract_last_assistant(p) == ""
 
 
 def test_option_description_empty_vs_missing(tmp_path: Path) -> None:
-    # jq 真值语义：description="" 也是真 → 带冒号；缺失 → 不带（review focus #2）
+    # jq 真值语义：description="" 也是真 → 带冒号；缺失 → 不带
     p = write(tmp_path, [
         ask_entry([{"question": "Q?", "header": "H", "multiSelect": False,
                     "options": [{"label": "选项一", "description": ""},
@@ -601,15 +651,16 @@ def test_option_description_empty_vs_missing(tmp_path: Path) -> None:
     assert "- 选项二" in out and "- 选项二：" not in out
 
 
-def test_sidechain_assistant_resets(tmp_path: Path) -> None:
-    # sidechain assistant 也在 else 分支：参与重置且自身不出现
+def test_sidechain_assistant_ignored(tmp_path: Path) -> None:
+    # sidechain：内容不进通知、也不构成重置边界（本计划决定，见语义表）
     p = write(tmp_path, [
         assistant_entry("主链前文"),
         sidechain_entry("侧链内容"),
         assistant_entry("主链后文"),
     ])
-    out = transcript.extract_last_assistant(p)
-    assert out == "主链后文"
+    assert transcript.extract_last_assistant(p) == "主链前文\n\n主链后文"
+    p = write(tmp_path, [sidechain_entry("只有侧链")])
+    assert transcript.extract_last_assistant(p) == ""
 
 
 def test_empty_assistant_entry_does_not_reset(tmp_path: Path) -> None:
@@ -637,14 +688,15 @@ Expected: FAIL — `ImportError: No module named 'cc_feishu.transcript'`（或 `
 
 - [ ] **Step 3: 写实现**
 
-`src/cc_feishu/transcript.py`（自旧脚本 jq 程序逐语义迁移）：
+`src/cc_feishu/transcript.py`（块级格式自旧 jq 迁移；条目类型规则按设计 0fe935f 修订版）：
 
 ```python
 """transcript jsonl 解析 → 最后一段连续 assistant 内容。
 
-两次线上 bug 的修复结论固化于此：
+三次线上 bug 的修复结论固化于此：
 1. AskUserQuestion 的问题在 tool_use 块里——漏掉则通知只有铺垫文本
-2. 提问时需携带上文——只取 last 条目则丢失上下文
+2. 提问时需携带上文——只取 last 条目则丢失回答问题所需的上下文
+3. turn 结束后 transcript 会追加元数据条目——重置只认 user 条目，其余一律忽略
 """
 
 import json
@@ -657,6 +709,10 @@ TAIL_LINES = 100  # 与旧脚本 tail -n 100 等价
 def _is_main_assistant(e: object) -> bool:
     """主链 assistant：type == "assistant" 且 isSidechain 不为 true（jq: $e.isSidechain != true）。"""
     return isinstance(e, dict) and e.get("type") == "assistant" and e.get("isSidechain") is not True
+
+
+def _is_user(e: object) -> bool:
+    return isinstance(e, dict) and e.get("type") == "user"
 
 
 def _fmt_question(q: dict[str, Any]) -> str:
@@ -720,8 +776,10 @@ def _fmt_assistant(e: dict[str, Any]) -> str:
 def extract_last_assistant(transcript_path: str | Path) -> str:
     """最后一段连续主链 assistant 条目的内容合并。
 
+    条目规则（设计 0fe935f）：assistant 主链追加、user 重置、其余（sidechain 与
+    last-prompt/ai-title/mode 等元数据）忽略。
     任一行坏 JSON → 返回 ""（与旧 jq 链路一致：全有或全无，绝不出半截内容）。
-    空行跳过（旧链路遇空行整体报错，此处更稳；已记录的无害差异）。
+    空行跳过（旧链路遇空行整体报错，此处更稳；已记录的差异 #4）。
     """
     path = Path(transcript_path)
     if not path.is_file():
@@ -742,8 +800,9 @@ def extract_last_assistant(transcript_path: str | Path) -> str:
             t = _fmt_assistant(e)
             if t:  # 空内容条目被过滤但不重置（jq map(select(length>0))）
                 texts.append(t)
-        else:
-            texts = []  # user/tool_result/sidechain 边界 → 重置
+        elif _is_user(e):
+            texts = []  # user（用户输入/tool_result）是真正的对话边界 → 重置
+        # 其余一切类型：忽略——元数据与 sidechain 既不追加也不重置（bug #3 修复）
     # 旧脚本经 $(...) 命令替换取 jq 输出，会剥掉全部尾部换行——逐字节对齐必须复刻
     return "\n\n".join(texts).rstrip("\n")
 ```
@@ -751,7 +810,7 @@ def extract_last_assistant(transcript_path: str | Path) -> str:
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `pytest tests/test_transcript.py -v`
-Expected: 12 PASS
+Expected: 15 PASS
 
 - [ ] **Step 5: 质量门槛 + Commit**
 
@@ -759,9 +818,8 @@ Run: `ruff format . && ruff check . && mypy src && pytest`
 
 ```bash
 git add src/cc_feishu/transcript.py tests/test_transcript.py
-git commit -m "feat(transcript): jsonl 提取最后连续 assistant 段（T6/T7 断言迁入）"
+git commit -m "feat(transcript): jsonl 提取（user-only 重置 + 元数据忽略，T6/T7 断言迁入）"
 ```
-
 ### Task 4: config.py 配置加载
 
 **Files:**
@@ -1726,15 +1784,56 @@ for t in t1 t2 t3 t4 t6 t7; do
 done
 check "no-transcript" '{"message":"test notify","cwd":"/tmp/wd"}'
 check "small-budget" "$(printf '{"transcript_path":"%s/t2.jsonl","message":"test notify","cwd":"/tmp/wd"}' "$WORK")" "FEISHU_CHUNK_BYTES=3000"
-for tp in $(ls -t ~/.claude/projects/*/*.jsonl 2>/dev/null | head -3); do
-  check "real:$(basename "$tp" .jsonl)" "$(printf '{"transcript_path":"%s","message":"test notify","cwd":"/tmp/wd"}' "$tp")"
+
+# 真实 transcript：新语义忽略元数据/sidechain，旧 jq 会被它们重置——旧侧基线用
+# 「过滤掉被忽略条目后的同一文件」构造（等价关系见 Global Constraints 差异 #5）
+python3 - "$WORK" <<'PY'
+import json, sys, glob, os
+from pathlib import Path
+w = Path(sys.argv[1])
+def is_ignored(e):
+    if not isinstance(e, dict):
+        return True
+    if e.get("type") == "user":
+        return False
+    if e.get("type") == "assistant" and e.get("isSidechain") is not True:
+        return False
+    return True  # sidechain assistant 与所有元数据类型
+reals = sorted(glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")), key=os.path.getmtime, reverse=True)[:3]
+for i, p in enumerate(reals):
+    kept = []
+    for ln in open(p, encoding="utf-8", errors="replace"):
+        try:
+            e = json.loads(ln)
+        except ValueError:
+            kept.append(ln)  # 坏行保留：两侧都应整体为空
+            continue
+        if not is_ignored(e):
+            kept.append(json.dumps(e, ensure_ascii=False))
+    (w / f"real{i}.jsonl").write_text("".join(kept), encoding="utf-8")
+    with open(w / f"real{i}.path", "w") as f:
+        f.write(p)
+PY
+for i in 0 1 2; do
+  raw=$(cat "$WORK/real$i.path")
+  filt="$WORK/real$i.jsonl"
+  printf '%s' "$(printf '{"transcript_path":"%s","message":"test notify","cwd":"/tmp/wd"}' "$filt")" \
+    | DRY_RUN=1 "$HOME/.local/bin/notify_feishu.sh" > "$WORK/old.out" 2>/dev/null
+  printf '%s' "$(printf '{"transcript_path":"%s","message":"test notify","cwd":"/tmp/wd"}' "$raw")" \
+    | DRY_RUN=1 CC_FEISHU_CONFIG="$CFG" cc-feishu notify > "$WORK/new.out" 2>/dev/null
+  if cmp -s "$WORK/old.out" "$WORK/new.out"; then
+    pass=$((pass+1)); echo "PASS real:$(basename "$raw" .jsonl)"
+  else
+    fail=$((fail+1)); echo "FAIL real:$(basename "$raw" .jsonl)"; diff "$WORK/old.out" "$WORK/new.out" | head -10
+    echo "  （若 diff 仅因末 100 行窗口内被忽略条目挤占窗口所致，人工核对后可放行——见差异 #5 说明）"
+  fi
 done
 echo; echo "结果: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
 ```
 
 Run: `bash /tmp/m1-compare.sh`
-Expected: 全部 PASS（含 3 个真实 transcript）。任何 FAIL → 用 diff 定位语义偏差，回到对应任务修正后重跑；**比对通过是 M1 验收的硬门槛**。
+Expected: 全部 PASS。真实 transcript 组的口径：**旧侧喂「过滤掉被忽略条目后的同一文件」，新侧喂原始文件**——这验证的正是等价关系「新语义(raw) == 旧语义(过滤后)」（差异 #5）。pytest 中的 `test_trailing_metadata_preserves_content` 已单独锁定新语义对原始文件保留正文。任何 FAIL → 用 diff 定位语义偏差，回到对应任务修正后重跑；**比对通过是 M1 验收的硬门槛**。
 
 - [ ] **Step 4: 旧 bash 套件再跑一遍（退役前留档）**
 
@@ -1792,4 +1891,4 @@ git commit -m "chore: M1 验收完成（DRY_RUN 逐字节比对通过 + 真实�
 2. **占位符扫描**：已清除全部"实现时再改"注记与笔误示例；所有代码块可直接落地。
 3. **类型一致性**：`split_notify_chunks`/`byte_len`（Task 2 定义，Task 6 消费）、`extract_last_assistant`（Task 3 定义，Task 6 消费）、`Config`/`load_config`/`effective_*`（Task 4 定义，Task 6 消费）、`send_chunks`（Task 5 定义，Task 6 经 `notify.lark.send_chunks` 消费）、`patch_settings`/`run_install`（Task 7 定义，CLI 消费）——签名已逐一核对。
 4. **Review Focus**：五条 + 两条补充均有具名测试。
-5. **计划内代码已实证**（2026-10-15，计划编写时对拍）：Task 2 的 chunk 代码与旧脚本 heredoc python 逐字节对拍 16 组（8 文本 × 2 预算）全一致；Task 3 的 transcript 代码与旧 jq 链路（含 `tail -n 100` 与 `$(...)` 尾部换行剥离口径）对拍 20 组全一致（15 构造场景 + 5 个真实 transcript）。对拍中发现并修复一处计划 bug：jq 输出经 `$(...)` 会剥掉全部尾部换行，`extract_last_assistant` 必须 `rstrip("\n")` 才能逐字节对齐——已写入实现与注释。
+5. **计划内代码已实证**（2026-10-15，计划编写时对拍）：Task 2 的 chunk 代码与旧脚本 heredoc python 逐字节对拍 16 组（8 文本 × 2 预算）全一致；Task 3 的 transcript 代码按新语义（user-only 重置）验证等价关系 `新(raw) == 旧jq(过滤掉被忽略条目)` 于构造场景与真实 transcript。对拍中发现并修复一处对齐 bug：jq 输出经 `$(...)` 会剥掉全部尾部换行，`extract_last_assistant` 必须 `rstrip("\n")` 才能逐字节对齐——已写入实现与注释。写作期间设计文档经 0fe935f 修订（第三次 bug：元数据条目清空正文），Task 3/Task 8/Global Constraints 已同步改版。
