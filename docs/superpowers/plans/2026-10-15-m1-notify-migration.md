@@ -78,7 +78,9 @@ def test_python_m_help_exits_zero() -> None:
     repo = Path(__file__).resolve().parents[1]
     p = subprocess.run(
         [sys.executable, "-m", "cc_feishu", "--help"],
-        capture_output=True, text=True, cwd=repo,
+        capture_output=True,
+        text=True,
+        cwd=repo,
         env={"PYTHONPATH": str(repo / "src"), "PATH": "/usr/bin:/bin"},
     )
     assert p.returncode == 0
@@ -249,7 +251,7 @@ def body_lines(chunks: list[str]) -> list[str]:
 def assert_chunks_ok(chunks: list[str], budget: int) -> None:
     for i, c in enumerate(chunks):
         fences = [ln for ln in c.split("\n") if unquote(ln).lstrip().startswith("```")]
-        assert len(fences) % 2 == 0, f"chunk {i+1}: unbalanced fences ({len(fences)})"
+        assert len(fences) % 2 == 0, f"chunk {i + 1}: unbalanced fences ({len(fences)})"
 
 
 def test_byte_len() -> None:
@@ -352,9 +354,12 @@ def _fence_marker(line: str) -> str | None:
     return s if s.startswith("```") else None
 
 
-def _hard_split(line: str, room: int, prefix: str, budget: int) -> list[str] | None:
+def _hard_split(line: str, room: int, prefix: str, hard_budget: int) -> list[str] | None:
     """超长行按 UTF-8 字符边界硬切：首段进 room 字节，续段补 prefix。
 
+    续段预算用 hard_budget - 32：旧脚本的续段 room 读模块级全局 budget（原始
+    预算），不随 chunk_text 本次调用的（可能已缩减的）budget 变化，移植须复刻
+    （M1 验收 T4 逐字节比对失败暴露的移植 bug，2026-10-15 修复）。
     返回 None 表示预算小到放不下一个字符，由调用方兜底。"""
     pieces: list[str] = []
     data = line.encode("utf-8")
@@ -369,14 +374,19 @@ def _hard_split(line: str, room: int, prefix: str, budget: int) -> list[str] | N
         pieces.append(piece if first else prefix + piece)
         first = False
         data = data[cut:]
-        room = budget - 32  # 续段预算：留出 prefix、换行、围栏重开头和片尾闭合的余量
+        room = hard_budget - 32  # 续段预算：留出 prefix、换行、围栏重开头和片尾闭合的余量
     piece = data.decode("utf-8", "replace")
     pieces.append(piece if first else prefix + piece)
     return pieces
 
 
-def chunk_text(text: str, budget: int) -> list[str]:
-    """尽量切在空行/换行处；切点落在代码围栏中间时片尾补闭合、下片重开。"""
+def chunk_text(text: str, budget: int, *, hard_budget: int | None = None) -> list[str]:
+    """尽量切在空行/换行处；切点落在代码围栏中间时片尾补闭合、下片重开。
+
+    hard_budget 缺省为 budget；多片重切时调用方传原始 budget（见 split_notify_chunks）。
+    """
+    if hard_budget is None:
+        hard_budget = budget
     chunks: list[str] = []
     cur: list[str] = []
     cur_b = 0
@@ -422,7 +432,7 @@ def chunk_text(text: str, budget: int) -> list[str]:
         # 单行自身就超预算：按 UTF-8 边界硬切。
         # 围栏标记行不可能是超长行，所以围栏状态在行内不会变化。
         prefix = "" if fence_open else "> "
-        pieces = _hard_split(line, budget - cur_b - reserve - 1, prefix, budget)
+        pieces = _hard_split(line, budget - cur_b - reserve - 1, prefix, hard_budget)
         if pieces is None:
             pieces = [line]  # 极端小预算兜底，允许单片略超
         for piece in pieces:
@@ -437,12 +447,15 @@ def chunk_text(text: str, budget: int) -> list[str]:
 
 
 def split_notify_chunks(full: str, budget: int) -> list[str]:
-    """分片并给第 2 片起加「（续 i/n)」标记：多片时预留标记空间后重切。"""
+    """分片并给第 2 片起加「（续 i/n）」标记：多片时预留标记空间后重切。"""
     chunks = chunk_text(full, budget)
     if len(chunks) > 1:
-        # 预留「（续 i/n）」标记的空间后重切，确保加标记后仍不超预算
-        chunks = chunk_text(full, budget - 64)
-        chunks[1:] = ["（续 %d/%d）\n\n" % (i + 2, len(chunks)) + c for i, c in enumerate(chunks[1:])]
+        # 预留「（续 i/n）」标记的空间后重切，确保加标记后仍不超预算；
+        # hard_budget 传原始 budget：旧脚本续段 room 读全局（原始）预算，不随 -64 缩减
+        chunks = chunk_text(full, budget - 64, hard_budget=budget)
+        chunks[1:] = [
+            "（续 %d/%d）\n\n" % (i + 2, len(chunks)) + c for i, c in enumerate(chunks[1:])
+        ]
     return chunks
 ```
 
@@ -503,28 +516,50 @@ from cc_feishu import transcript
 
 def assistant_entry(text: str) -> str:
     return json.dumps(
-        {"type": "assistant", "isSidechain": False,
-         "message": {"content": [{"type": "text", "text": text}]}},
-        ensure_ascii=False)
+        {
+            "type": "assistant",
+            "isSidechain": False,
+            "message": {"content": [{"type": "text", "text": text}]},
+        },
+        ensure_ascii=False,
+    )
 
 
 def ask_entry(questions: list[dict[str, Any]]) -> str:
     return json.dumps(
-        {"type": "assistant", "isSidechain": False,
-         "message": {"content": [{"type": "tool_use", "id": "call_x", "name": "AskUserQuestion",
-                                  "input": {"questions": questions}}]}},
-        ensure_ascii=False)
+        {
+            "type": "assistant",
+            "isSidechain": False,
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call_x",
+                        "name": "AskUserQuestion",
+                        "input": {"questions": questions},
+                    }
+                ]
+            },
+        },
+        ensure_ascii=False,
+    )
 
 
 def user_entry() -> str:
-    return json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "content": "ok"}]}})
+    return json.dumps(
+        {"type": "user", "message": {"content": [{"type": "tool_result", "content": "ok"}]}}
+    )
 
 
 def sidechain_entry(text: str) -> str:
     return json.dumps(
-        {"type": "assistant", "isSidechain": True,
-         "message": {"content": [{"type": "text", "text": text}]}},
-        ensure_ascii=False)
+        {
+            "type": "assistant",
+            "isSidechain": True,
+            "message": {"content": [{"type": "text", "text": text}]},
+        },
+        ensure_ascii=False,
+    )
 
 
 def meta_entry(mtype: str) -> str:
@@ -555,26 +590,49 @@ def test_malformed_line_returns_empty(tmp_path: Path) -> None:
 def test_partial_content_never_leaks(tmp_path: Path) -> None:
     # 半行（Claude 正在写入时触发 hook）：join 前被截断的内容不能泄漏
     p = tmp_path / "t.jsonl"
-    p.write_text(assistant_entry("完整行") + '\n{"type":"assistant","isSidechain":false,', encoding="utf-8")
+    p.write_text(
+        assistant_entry("完整行") + '\n{"type":"assistant","isSidechain":false,', encoding="utf-8"
+    )
     assert transcript.extract_last_assistant(p) == ""
 
 
 def test_plain_string_content(tmp_path: Path) -> None:
     # 旧版 content 为字符串的条目（老格式兼容）
     p = tmp_path / "t.jsonl"
-    p.write_text(json.dumps({"type": "assistant", "isSidechain": False,
-                             "message": {"content": "字符串正文"}}, ensure_ascii=False) + "\n",
-                 encoding="utf-8")
+    p.write_text(
+        json.dumps(
+            {"type": "assistant", "isSidechain": False, "message": {"content": "字符串正文"}},
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     assert transcript.extract_last_assistant(p) == "字符串正文"
 
 
 def test_ask_user_question(tmp_path: Path) -> None:  # T6 场景（4 断言）
-    p = write(tmp_path, [
-        assistant_entry("问题前的铺垫说明文字。"),
-        ask_entry([{"question": "选哪个方案？", "header": "形态路线", "multiSelect": False,
-                    "options": [{"label": "B：独立项目（推荐）", "description": "pipx 装 CLI + install.sh"},
-                                {"label": "先小重构缓建仓", "description": "单文件 Python"}]}]),
-    ])
+    p = write(
+        tmp_path,
+        [
+            assistant_entry("问题前的铺垫说明文字。"),
+            ask_entry(
+                [
+                    {
+                        "question": "选哪个方案？",
+                        "header": "形态路线",
+                        "multiSelect": False,
+                        "options": [
+                            {
+                                "label": "B：独立项目（推荐）",
+                                "description": "pipx 装 CLI + install.sh",
+                            },
+                            {"label": "先小重构缓建仓", "description": "单文件 Python"},
+                        ],
+                    }
+                ]
+            ),
+        ],
+    )
     out = transcript.extract_last_assistant(p)
     assert "**形态路线** 选哪个方案？" in out  # T6 问题与标题
     assert "- B：独立项目（推荐）：pipx 装 CLI + install.sh" in out  # T6 选项含描述
@@ -583,20 +641,34 @@ def test_ask_user_question(tmp_path: Path) -> None:  # T6 场景（4 断言）
 
 
 def test_multiselect_marker(tmp_path: Path) -> None:
-    p = write(tmp_path, [
-        ask_entry([{"question": "Q?", "multiSelect": True, "options": [{"label": "a"}]}]),
-    ])
+    p = write(
+        tmp_path,
+        [
+            ask_entry([{"question": "Q?", "multiSelect": True, "options": [{"label": "a"}]}]),
+        ],
+    )
     assert "（可多选）" in transcript.extract_last_assistant(p)
 
 
 def test_boundary_reset(tmp_path: Path) -> None:  # T7 场景（2 断言）
-    p = write(tmp_path, [
-        assistant_entry("上一轮的陈旧文本。"),
-        user_entry(),
-        assistant_entry("本轮的说明文字。"),
-        ask_entry([{"question": "T7 的问题？", "header": "测试", "multiSelect": False,
-                    "options": [{"label": "选项一", "description": ""}]}]),
-    ])
+    p = write(
+        tmp_path,
+        [
+            assistant_entry("上一轮的陈旧文本。"),
+            user_entry(),
+            assistant_entry("本轮的说明文字。"),
+            ask_entry(
+                [
+                    {
+                        "question": "T7 的问题？",
+                        "header": "测试",
+                        "multiSelect": False,
+                        "options": [{"label": "选项一", "description": ""}],
+                    }
+                ]
+            ),
+        ],
+    )
     out = transcript.extract_last_assistant(p)
     assert "本轮的说明文字" in out and "**测试** T7 的问题？" in out  # T7 本轮文本+问题都在
     assert "上一轮的陈旧文本" not in out  # T7 旧轮文本被 user 边界重置
@@ -604,32 +676,38 @@ def test_boundary_reset(tmp_path: Path) -> None:  # T7 场景（2 断言）
 
 def test_trailing_metadata_preserves_content(tmp_path: Path) -> None:
     # 第三次线上 bug（设计 0fe935f）：turn 结束后追加的元数据不得清空正文
-    p = write(tmp_path, [
-        user_entry(),
-        assistant_entry("本轮生成的主要内容。"),
-        meta_entry("last-prompt"),
-        meta_entry("ai-title"),
-        meta_entry("mode"),
-        meta_entry("permission-mode"),
-        meta_entry("atis-latch"),
-        meta_entry("attachment"),
-        meta_entry("system"),
-        meta_entry("file-history-snapshot"),
-        meta_entry("cost-state"),
-    ])
+    p = write(
+        tmp_path,
+        [
+            user_entry(),
+            assistant_entry("本轮生成的主要内容。"),
+            meta_entry("last-prompt"),
+            meta_entry("ai-title"),
+            meta_entry("mode"),
+            meta_entry("permission-mode"),
+            meta_entry("atis-latch"),
+            meta_entry("attachment"),
+            meta_entry("system"),
+            meta_entry("file-history-snapshot"),
+            meta_entry("cost-state"),
+        ],
+    )
     assert transcript.extract_last_assistant(p) == "本轮生成的主要内容。"
 
 
 def test_metadata_between_turns_same_as_old(tmp_path: Path) -> None:
     # 元数据夹在两轮之间且随后有 user 边界：新旧语义等价（都只剩本轮）
-    p = write(tmp_path, [
-        assistant_entry("上一轮内容"),
-        meta_entry("last-prompt"),
-        meta_entry("ai-title"),
-        user_entry(),
-        assistant_entry("本轮内容"),
-        meta_entry("mode"),
-    ])
+    p = write(
+        tmp_path,
+        [
+            assistant_entry("上一轮内容"),
+            meta_entry("last-prompt"),
+            meta_entry("ai-title"),
+            user_entry(),
+            assistant_entry("本轮内容"),
+            meta_entry("mode"),
+        ],
+    )
     assert transcript.extract_last_assistant(p) == "本轮内容"
 
 
@@ -641,11 +719,21 @@ def test_only_metadata_returns_empty(tmp_path: Path) -> None:
 
 def test_option_description_empty_vs_missing(tmp_path: Path) -> None:
     # jq 真值语义：description="" 也是真 → 带冒号；缺失 → 不带
-    p = write(tmp_path, [
-        ask_entry([{"question": "Q?", "header": "H", "multiSelect": False,
-                    "options": [{"label": "选项一", "description": ""},
-                                {"label": "选项二"}]}]),
-    ])
+    p = write(
+        tmp_path,
+        [
+            ask_entry(
+                [
+                    {
+                        "question": "Q?",
+                        "header": "H",
+                        "multiSelect": False,
+                        "options": [{"label": "选项一", "description": ""}, {"label": "选项二"}],
+                    }
+                ]
+            ),
+        ],
+    )
     out = transcript.extract_last_assistant(p)
     assert "- 选项一：" in out
     assert "- 选项二" in out and "- 选项二：" not in out
@@ -653,11 +741,14 @@ def test_option_description_empty_vs_missing(tmp_path: Path) -> None:
 
 def test_sidechain_assistant_ignored(tmp_path: Path) -> None:
     # sidechain：内容不进通知、也不构成重置边界（本计划决定，见语义表）
-    p = write(tmp_path, [
-        assistant_entry("主链前文"),
-        sidechain_entry("侧链内容"),
-        assistant_entry("主链后文"),
-    ])
+    p = write(
+        tmp_path,
+        [
+            assistant_entry("主链前文"),
+            sidechain_entry("侧链内容"),
+            assistant_entry("主链后文"),
+        ],
+    )
     assert transcript.extract_last_assistant(p) == "主链前文\n\n主链后文"
     p = write(tmp_path, [sidechain_entry("只有侧链")])
     assert transcript.extract_last_assistant(p) == ""
@@ -665,12 +756,20 @@ def test_sidechain_assistant_ignored(tmp_path: Path) -> None:
 
 def test_empty_assistant_entry_does_not_reset(tmp_path: Path) -> None:
     # 无可用内容的 assistant 条目：过滤但不重置（jq map(select(length>0))）
-    p = write(tmp_path, [
-        assistant_entry("前文"),
-        json.dumps({"type": "assistant", "isSidechain": False,
-                    "message": {"content": [{"type": "thinking", "thinking": "…"}]}}),
-        assistant_entry("后文"),
-    ])
+    p = write(
+        tmp_path,
+        [
+            assistant_entry("前文"),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "isSidechain": False,
+                    "message": {"content": [{"type": "thinking", "thinking": "…"}]},
+                }
+            ),
+            assistant_entry("后文"),
+        ],
+    )
     assert transcript.extract_last_assistant(p) == "前文\n\n后文"
 
 
@@ -871,7 +970,9 @@ def test_load_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.routing_ttl_hours == 24
 
 
-def test_broken_toml_falls_back_to_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_broken_toml_falls_back_to_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     p = write_cfg(tmp_path, "not [valid toml")
     monkeypatch.setenv("CC_FEISHU_CONFIG", str(p))
     assert config.load_config() == config.Config()
@@ -1049,8 +1150,19 @@ def test_send_markdown_success(monkeypatch: pytest.MonkeyPatch) -> None:
     ok, err = lark.send_markdown("ou_x", "# hello")
     assert ok
     assert err == ""
-    assert fake.calls == [["lark-cli", "im", "+messages-send", "--as", "bot",
-                           "--user-id", "ou_x", "--markdown", "# hello"]]
+    assert fake.calls == [
+        [
+            "lark-cli",
+            "im",
+            "+messages-send",
+            "--as",
+            "bot",
+            "--user-id",
+            "ou_x",
+            "--markdown",
+            "# hello",
+        ]
+    ]
 
 
 def test_send_markdown_failure_truncated(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1063,6 +1175,7 @@ def test_send_markdown_failure_truncated(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_send_markdown_cli_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     def raise_fn(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         raise FileNotFoundError("lark-cli")
+
     monkeypatch.setattr(lark.subprocess, "run", raise_fn)
     ok, err = lark.send_markdown("ou_x", "文本")
     assert not ok
@@ -1127,7 +1240,9 @@ def send_chunks(uid: str, chunks: list[str]) -> int:
         ok, err = send_markdown(uid, c)
         if not ok:
             failed += 1
-            sys.stderr.write("cc-feishu notify: 第 %d/%d 片发送失败: %s\n" % (i + 1, len(chunks), err))
+            sys.stderr.write(
+                "cc-feishu notify: 第 %d/%d 片发送失败: %s\n" % (i + 1, len(chunks), err)
+            )
         if i < len(chunks) - 1:
             time.sleep(CHUNK_INTERVAL)
     return failed
@@ -1188,10 +1303,15 @@ from cc_feishu import chunk, notify
 REPO = Path(__file__).resolve().parents[1]
 
 
-def run_cli(hook_json: str, *, flag: bool = False, dry_env: bool = True) -> subprocess.CompletedProcess[str]:
+def run_cli(
+    hook_json: str, *, flag: bool = False, dry_env: bool = True
+) -> subprocess.CompletedProcess[str]:
     """DRY_RUN 环境变量或 --dry-run 标志运行 notify 子命令。"""
-    env = {"PYTHONPATH": str(REPO / "src"), "PATH": "/usr/bin:/bin",
-           "CC_FEISHU_CONFIG": "/nonexistent/config.toml"}
+    env = {
+        "PYTHONPATH": str(REPO / "src"),
+        "PATH": "/usr/bin:/bin",
+        "CC_FEISHU_CONFIG": "/nonexistent/config.toml",
+    }
     if dry_env:
         env["DRY_RUN"] = "1"
     cmd = [sys.executable, "-m", "cc_feishu", "notify"]
@@ -1202,15 +1322,26 @@ def run_cli(hook_json: str, *, flag: bool = False, dry_env: bool = True) -> subp
 
 def write_transcript(tmp_path: Path, text: str) -> Path:
     p = tmp_path / "t.jsonl"
-    p.write_text(json.dumps({"type": "assistant", "isSidechain": False,
-                             "message": {"content": [{"type": "text", "text": text}]}},
-                            ensure_ascii=False) + "\n", encoding="utf-8")
+    p.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "isSidechain": False,
+                "message": {"content": [{"type": "text", "text": text}]},
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return p
 
 
 def test_dry_run_short_message_t1(tmp_path: Path) -> None:
     tp = write_transcript(tmp_path, "你好，这是一条短消息，含代码：\n\n```python\nprint(1)\n```\n")
-    out = run_cli(json.dumps({"transcript_path": str(tp), "message": "test notify", "cwd": "/tmp/wd"}))
+    out = run_cli(
+        json.dumps({"transcript_path": str(tp), "message": "test notify", "cwd": "/tmp/wd"})
+    )
     assert out.returncode == 0
     assert "=== chunk 1/1 " in out.stdout  # T1 单片
     assert "> print(1)" in out.stdout  # T1 内容保留
@@ -1221,7 +1352,7 @@ def test_dry_run_short_message_t1(tmp_path: Path) -> None:
 def test_dry_run_flag_equivalent_to_env(tmp_path: Path) -> None:
     tp = write_transcript(tmp_path, "正文")
     hook = json.dumps({"transcript_path": str(tp), "message": "m", "cwd": "/w"})
-    by_env = run_cli(hook)                 # DRY_RUN=1 环境变量
+    by_env = run_cli(hook)  # DRY_RUN=1 环境变量
     by_flag = run_cli(hook, flag=True, dry_env=False)  # --dry-run 标志
     assert by_env.stdout == by_flag.stdout  # 两路等价
 
@@ -1249,8 +1380,10 @@ def test_empty_stdin_basic_notify() -> None:
 
 def test_build_notification_format() -> None:
     # 头部格式与旧脚本逐字节一致：# message\n\n- `cwd`\n\nfrom: label
-    assert notify.build_notification({"message": "等待输入权限确认", "cwd": "/home/x"}, "", "host1") \
+    assert (
+        notify.build_notification({"message": "等待输入权限确认", "cwd": "/home/x"}, "", "host1")
         == "# 等待输入权限确认\n\n- `/home/x`\n\nfrom: host1"
+    )
     # 无 message → "等待输入"；无 cwd → 空反引号（旧脚本 `or` 语义）
     assert notify.build_notification({}, "", "host1") == "# 等待输入\n\n- ``\n\nfrom: host1"
 
@@ -1352,11 +1485,15 @@ def notify(hook_json: str, dry_run: bool) -> int:
         print("=== end (%d chunks) ===" % n)
         return 0
     if not cfg.lark_uid:
-        sys.stderr.write("cc-feishu notify: 配置缺 lark_uid，跳过发送（先运行 cc-feishu install）\n")
+        sys.stderr.write(
+            "cc-feishu notify: 配置缺 lark_uid，跳过发送（先运行 cc-feishu install）\n"
+        )
         return 0
     failed = lark.send_chunks(cfg.lark_uid, chunks)
     if failed:
-        sys.stderr.write("cc-feishu notify: %d/%d 片发送失败（不中断会话）\n" % (failed, len(chunks)))
+        sys.stderr.write(
+            "cc-feishu notify: %d/%d 片发送失败（不中断会话）\n" % (failed, len(chunks))
+        )
     return 0
 ```
 
@@ -1468,15 +1605,27 @@ def test_default_config_text() -> None:
 
 
 def test_patch_settings_replaces_old_hook(tmp_path: Path) -> None:
-    p = write_settings(tmp_path, {"hooks": {"Notification": [
-        {"hooks": [{"type": "command", "command": "notify_feishu.sh"}]}]}})
+    p = write_settings(
+        tmp_path,
+        {
+            "hooks": {
+                "Notification": [{"hooks": [{"type": "command", "command": "notify_feishu.sh"}]}]
+            }
+        },
+    )
     assert install.patch_settings(p) is True
     assert notification_commands(p) == ["cc-feishu notify"]
 
 
 def test_patch_settings_idempotent(tmp_path: Path) -> None:
-    p = write_settings(tmp_path, {"hooks": {"Notification": [
-        {"hooks": [{"type": "command", "command": "cc-feishu notify"}]}]}})
+    p = write_settings(
+        tmp_path,
+        {
+            "hooks": {
+                "Notification": [{"hooks": [{"type": "command", "command": "cc-feishu notify"}]}]
+            }
+        },
+    )
     assert install.patch_settings(p) is False  # 已是目标状态 → 无改动
 
 
@@ -1501,14 +1650,24 @@ def test_patch_settings_malformed(tmp_path: Path) -> None:
 
 
 def test_patch_settings_preserves_other_hooks(tmp_path: Path) -> None:
-    p = write_settings(tmp_path, {"hooks": {
-        "Notification": [
-            {"hooks": [{"type": "command", "command": "notify_feishu.sh"}]},
-            {"hooks": [{"type": "command", "command": "other-notify.sh"}]},
-        ],
-        "UserPromptSubmit": [
-            {"hooks": [{"type": "command", "command": "codegraph prompt-hook", "timeout": 300}]}],
-    }})
+    p = write_settings(
+        tmp_path,
+        {
+            "hooks": {
+                "Notification": [
+                    {"hooks": [{"type": "command", "command": "notify_feishu.sh"}]},
+                    {"hooks": [{"type": "command", "command": "other-notify.sh"}]},
+                ],
+                "UserPromptSubmit": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": "codegraph prompt-hook", "timeout": 300}
+                        ]
+                    }
+                ],
+            }
+        },
+    )
     assert install.patch_settings(p) is True
     data = json.loads(p.read_text(encoding="utf-8"))
     notif = data["hooks"]["Notification"]
