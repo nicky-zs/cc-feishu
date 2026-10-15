@@ -35,7 +35,7 @@
 1. **transcript 尾部半行**（Claude Code 正在写入时触发 hook）：旧链路 jq 全有或全无——任一行坏则整体返回空、发基础通知，绝不能输出半截内容 → Task 3 `test_malformed_line_returns_empty` + `test_partial_content_never_leaks`
 2. **AskUserQuestion 选项 description 空串 vs 缺失**（jq 真值语义：空串也是真）：`""` 要产出 `"- 选项一："`（带冒号），缺失则不带 → Task 3 `test_option_description_empty_vs_missing`
 3. **hook stdin 非法 JSON**：降级为基础通知、退出 0，不能崩（已记录的与旧链路差异）→ Task 6 `test_cli_invalid_stdin_json_degrades`
-4. **极小/垃圾 chunk_bytes**：floor 到 1000；预算小到硬切放不下一个字符时兜底允许单片略超、不崩 → Task 2 `test_hard_split_fallback` + Task 4 `test_chunk_bytes_floor`
+4. **极小/垃圾 chunk_bytes**：floor 到 1000；小预算硬切不崩、UTF-8 边界安全、内容可精确还原（hard_split 返回 None 的兜底分支为旧脚本原样保留的防御代码，实践中不可达）→ Task 2 `test_hard_split_small_budget` + Task 4 `test_chunk_bytes_floor`
 5. **settings.json 缺失/损坏/Notification 里并存其他 hook**：install 不丢数据、不重复注册、幂等 → Task 7 `test_patch_settings_creates_missing` / `test_patch_settings_malformed` / `test_patch_settings_preserves_other_hooks`
 
 另有两条也已在任务内固化：单片发送失败不中断其余片（Task 6 `test_send_failure_isolated`）；数百 KB 正文不经 argv 传递、不崩（Task 6 `test_large_body_ok`，进程内直调）。
@@ -308,11 +308,11 @@ def test_single_long_line_hard_split() -> None:
     assert got == text
 
 
-def test_hard_split_fallback() -> None:
-    # 预算小到硬切放不下一个字符：兜底单片略超也不崩（review focus #4）
-    text = "汉" * 50
+def test_hard_split_small_budget() -> None:
+    # 小预算触发硬切：UTF-8 边界安全 + 精确还原（review focus #4）
+    text = "汉" * 200  # 600B 单行，引用化后 602B
     chunks = chunk.chunk_text(quote(text), 200)
-    assert len(chunks) >= 1
+    assert len(chunks) >= 3
     assert "".join(unquote(ln) for c in chunks for ln in c.split("\n") if ln.strip()) == text
 ```
 
@@ -744,13 +744,14 @@ def extract_last_assistant(transcript_path: str | Path) -> str:
                 texts.append(t)
         else:
             texts = []  # user/tool_result/sidechain 边界 → 重置
-    return "\n\n".join(texts)
+    # 旧脚本经 $(...) 命令替换取 jq 输出，会剥掉全部尾部换行——逐字节对齐必须复刻
+    return "\n\n".join(texts).rstrip("\n")
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `pytest tests/test_transcript.py -v`
-Expected: 13 PASS
+Expected: 12 PASS
 
 - [ ] **Step 5: 质量门槛 + Commit**
 
@@ -943,3 +944,852 @@ Run: `ruff format . && ruff check . && mypy src && pytest`
 git add src/cc_feishu/config.py tests/test_config.py
 git commit -m "feat(config): toml 配置加载与环境变量覆盖"
 ```
+
+### Task 5: lark.py 发送封装
+
+**Files:**
+- Create: `src/cc_feishu/lark.py`
+- Test: `tests/test_lark.py`
+
+**Interfaces:**
+- Consumes: 无
+- Produces:
+  - `lark.send_markdown(uid: str, markdown: str) -> tuple[bool, str]` — 调 `lark-cli im +messages-send --as bot --user-id <uid> --markdown <chunk>`；返回 (成功与否, 错误信息截断 500 字符)。lark-cli 不存在（FileNotFoundError）→ `(False, "lark-cli not found")`
+  - `lark.send_chunks(uid: str, chunks: list[str]) -> int` — 逐片发送，片间 sleep 0.3s，返回失败片数；单片失败不中断（记 stderr）
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/test_lark.py`（monkeypatch `subprocess.run` 和 `time.sleep`，不发真消息）：
+
+```python
+import subprocess
+
+import pytest
+
+from cc_feishu import lark
+
+
+class FakeRun:
+    def __init__(self, fail_on: str | None = None) -> None:
+        self.calls: list[list[str]] = []
+        self.sleeps: list[float] = []
+        self.fail_on = fail_on
+
+    def run(self, cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        self.calls.append(cmd)
+        if self.fail_on is not None and self.fail_on in (cmd[-1] if cmd else ""):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def sleep(self, s: float) -> None:
+        self.sleeps.append(s)
+
+
+def test_send_markdown_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeRun()
+    monkeypatch.setattr(lark.subprocess, "run", fake.run)
+    ok, err = lark.send_markdown("ou_x", "# hello")
+    assert ok
+    assert err == ""
+    assert fake.calls == [["lark-cli", "im", "+messages-send", "--as", "bot",
+                           "--user-id", "ou_x", "--markdown", "# hello"]]
+
+
+def test_send_markdown_failure_truncated(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeRun()
+    monkeypatch.setattr(lark.subprocess, "run", fake.run)
+    ok, err = lark.send_markdown("ou_x", "文本")
+    assert not ok
+
+
+def test_send_markdown_cli_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    def raise_fn(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError("lark-cli")
+    monkeypatch.setattr(lark.subprocess, "run", raise_fn)
+    ok, err = lark.send_markdown("ou_x", "文本")
+    assert not ok
+    assert "lark-cli not found" in err
+
+
+def test_send_chunks_throttle_and_isolated_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeRun(fail_on="第二片")
+    monkeypatch.setattr(lark.subprocess, "run", fake.run)
+    monkeypatch.setattr(lark.time, "sleep", fake.sleep)
+    failed = lark.send_chunks("ou_x", ["第一片", "第二片", "第三片"])
+    assert failed == 1
+    assert len(fake.calls) == 3  # 失败片不中断其余片
+    assert fake.sleeps == [0.3, 0.3]  # 片间限速
+
+
+def test_send_chunks_single_no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeRun()
+    monkeypatch.setattr(lark.subprocess, "run", fake.run)
+    monkeypatch.setattr(lark.time, "sleep", fake.sleep)
+    assert lark.send_chunks("ou_x", ["唯一片"]) == 0
+    assert fake.sleeps == []
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `pytest tests/test_lark.py -v`
+Expected: FAIL — `ImportError`
+
+- [ ] **Step 3: 写实现**
+
+`src/cc_feishu/lark.py`：
+
+```python
+"""lark-cli 封装：发送 markdown 消息。lark-cli 继续作为飞书 OpenAPI 执行层。"""
+
+import subprocess
+import sys
+import time
+
+SEND_CMD = ["lark-cli", "im", "+messages-send", "--as", "bot"]
+ERR_TRUNCATE = 500
+CHUNK_INTERVAL = 0.3  # 片间限速，避免触发消息发送频率限制
+
+
+def send_markdown(uid: str, markdown: str) -> tuple[bool, str]:
+    """发一条 markdown 消息给 uid。返回 (成功, 错误信息截断)。"""
+    cmd = [*SEND_CMD, "--user-id", uid, "--markdown", markdown]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return False, "lark-cli not found"
+    if p.returncode == 0:
+        return True, ""
+    return False, (p.stderr or p.stdout or "").strip()[:ERR_TRUNCATE]
+
+
+def send_chunks(uid: str, chunks: list[str]) -> int:
+    """逐片发送，返回失败片数。单片失败只记 stderr，不中断其余片。"""
+    failed = 0
+    for i, c in enumerate(chunks):
+        ok, err = send_markdown(uid, c)
+        if not ok:
+            failed += 1
+            sys.stderr.write("cc-feishu notify: 第 %d/%d 片发送失败: %s\n" % (i + 1, len(chunks), err))
+        if i < len(chunks) - 1:
+            time.sleep(CHUNK_INTERVAL)
+    return failed
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `pytest tests/test_lark.py -v`
+Expected: 5 PASS
+
+- [ ] **Step 5: 质量门槛 + Commit**
+
+Run: `ruff format . && ruff check . && mypy src && pytest`
+
+```bash
+git add src/cc_feishu/lark.py tests/test_lark.py
+git commit -m "feat(lark): lark-cli 发送封装（限速 + 失败隔离）"
+```
+
+### Task 6: notify.py 编排 + CLI 集成（DRY_RUN 行为对齐）
+
+**Files:**
+- Create: `src/cc_feishu/notify.py`
+- Modify: `src/cc_feishu/cli.py`
+- Test: `tests/test_notify.py`
+
+**Interfaces:**
+- Consumes: `chunk.split_notify_chunks`、`chunk.byte_len`、`transcript.extract_last_assistant`、`config.load_config`/`effective_chunk_bytes`/`effective_from_label`、`lark.send_chunks`
+- Produces:
+  - `notify.build_notification(hook: dict[str, Any], last_msg: str, from_label: str) -> str` — 头部 `# {message 或 "等待输入"}\n\n- \`{cwd}\`\n\nfrom: {label}`；有正文时空行 + `"> " + "\n> ".join(行)`
+  - `notify.notify(hook_json: str, dry_run: bool) -> int` — 完整链路，恒返回 0；dry_run 时按旧格式打印分片
+  - CLI `cc-feishu notify [--dry-run]`：stdin 读 hook JSON；`DRY_RUN=1` 等价 `--dry-run`（cli.py 负责 stdin/env，notify.py 无 CLI 代码）
+
+**DRY_RUN 输出格式（与旧脚本逐字节一致）**：
+
+```
+=== chunk {i}/{n} (bytes={UTF-8 字节数}) ===
+{chunk 文本}
+=== chunk {i+1}/{n} (bytes=...) ===
+...
+=== end ({n} chunks) ===
+```
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/test_notify.py`（T1/T5 断言的 CLI 级迁移 + review focus #3/#6 + 大正文）：
+
+```python
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from cc_feishu import chunk, notify
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+def run_cli(hook_json: str, *, flag: bool = False, dry_env: bool = True) -> subprocess.CompletedProcess[str]:
+    """DRY_RUN 环境变量或 --dry-run 标志运行 notify 子命令。"""
+    env = {"PYTHONPATH": str(REPO / "src"), "PATH": "/usr/bin:/bin",
+           "CC_FEISHU_CONFIG": "/nonexistent/config.toml"}
+    if dry_env:
+        env["DRY_RUN"] = "1"
+    cmd = [sys.executable, "-m", "cc_feishu", "notify"]
+    if flag:
+        cmd.append("--dry-run")
+    return subprocess.run(cmd, input=hook_json, capture_output=True, text=True, cwd=REPO, env=env)
+
+
+def write_transcript(tmp_path: Path, text: str) -> Path:
+    p = tmp_path / "t.jsonl"
+    p.write_text(json.dumps({"type": "assistant", "isSidechain": False,
+                             "message": {"content": [{"type": "text", "text": text}]}},
+                            ensure_ascii=False) + "\n", encoding="utf-8")
+    return p
+
+
+def test_dry_run_short_message_t1(tmp_path: Path) -> None:
+    tp = write_transcript(tmp_path, "你好，这是一条短消息，含代码：\n\n```python\nprint(1)\n```\n")
+    out = run_cli(json.dumps({"transcript_path": str(tp), "message": "test notify", "cwd": "/tmp/wd"}))
+    assert out.returncode == 0
+    assert "=== chunk 1/1 " in out.stdout  # T1 单片
+    assert "> print(1)" in out.stdout  # T1 内容保留
+    assert "已截断" not in out.stdout  # T1 无截断标记
+    assert out.stdout.endswith("=== end (1 chunks) ===\n")  # 输出格式收尾
+
+
+def test_dry_run_flag_equivalent_to_env(tmp_path: Path) -> None:
+    tp = write_transcript(tmp_path, "正文")
+    hook = json.dumps({"transcript_path": str(tp), "message": "m", "cwd": "/w"})
+    by_env = run_cli(hook)                 # DRY_RUN=1 环境变量
+    by_flag = run_cli(hook, flag=True, dry_env=False)  # --dry-run 标志
+    assert by_env.stdout == by_flag.stdout  # 两路等价
+
+
+def test_basic_notify_without_transcript_t5() -> None:
+    out = run_cli(json.dumps({"message": "test notify", "cwd": "/tmp/wd"}))
+    assert out.returncode == 0
+    assert "=== chunk 1/1 " in out.stdout  # T5 单片基础通知
+    assert "from: " in out.stdout  # T5 头部保留（默认 hostname，Task 4 已单测）
+
+
+def test_cli_invalid_stdin_json_degrades() -> None:
+    # hook stdin 非法 JSON：降级基础通知，退出 0，不崩（review focus #3，已记录差异 #2）
+    out = run_cli("{not json")
+    assert out.returncode == 0
+    assert "=== chunk 1/1 " in out.stdout
+    assert "等待输入" in out.stdout  # message 缺省文案
+
+
+def test_empty_stdin_basic_notify() -> None:
+    out = run_cli("")
+    assert out.returncode == 0
+    assert "=== chunk 1/1 " in out.stdout
+
+
+def test_build_notification_format() -> None:
+    # 头部格式与旧脚本逐字节一致：# message\n\n- `cwd`\n\nfrom: label
+    assert notify.build_notification({"message": "等待输入权限确认", "cwd": "/home/x"}, "", "host1") \
+        == "# 等待输入权限确认\n\n- `/home/x`\n\nfrom: host1"
+    # 无 message → "等待输入"；无 cwd → 空反引号（旧脚本 `or` 语义）
+    assert notify.build_notification({}, "", "host1") == "# 等待输入\n\n- ``\n\nfrom: host1"
+
+
+def test_quote_body() -> None:
+    # 正文引用化：首行 "> "，续行 "\n> "（空行成 "> "，旧脚本行为）
+    full = notify.build_notification({"message": "m", "cwd": "/w"}, "第一行\n\n第二行", "h")
+    assert full.endswith("> 第一行\n> \n> 第二行")
+
+
+def test_large_body_ok() -> None:
+    # 数百 KB 正文：进程内直调不崩、分片正确（review focus 补充：argv 上限不复存在）
+    big = "汉字内容测试" * 20000  # ~420KB
+    full = notify.build_notification({"message": "test", "cwd": "/tmp/wd"}, big, "box")
+    chunks = chunk.split_notify_chunks(full, 12000)
+    assert len(chunks) > 10
+    for c in chunks:
+        assert chunk.byte_len(c) <= 12000
+
+
+def test_send_failure_isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 发送失败：返回 0、失败记 stderr、best-effort 不中断（review focus 补充条目）
+    sent: list[list[str]] = []
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('lark_uid = "ou_x"\n', encoding="utf-8")
+    monkeypatch.setenv("CC_FEISHU_CONFIG", str(cfg))
+
+    def fake_send_chunks(uid: str, chunks: list[str]) -> int:
+        sent.append(chunks)
+        return 1  # 全部失败
+
+    monkeypatch.setattr(notify.lark, "send_chunks", fake_send_chunks)
+    rc = notify.notify(json.dumps({"message": "m", "cwd": "/w"}), dry_run=False)
+    assert rc == 0
+    assert len(sent) == 1  # 基础通知单片
+
+
+def test_missing_uid_skips_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CC_FEISHU_CONFIG", "/nonexistent/config.toml")
+    boom = RuntimeError("should not send")
+    monkeypatch.setattr(notify.lark, "send_chunks", boom)
+    rc = notify.notify(json.dumps({"message": "m", "cwd": "/w"}), dry_run=False)
+    assert rc == 0  # 未配置 lark_uid：跳过发送而非崩溃
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `pytest tests/test_notify.py -v`
+Expected: FAIL — `ImportError`
+
+- [ ] **Step 3: 写实现**
+
+`src/cc_feishu/notify.py`：
+
+```python
+"""Notification hook 编排：hook JSON → 提取 → 分片 → 发送。best-effort，恒成功返回。"""
+
+import json
+import sys
+from typing import Any
+
+from cc_feishu import chunk, config, lark, transcript
+
+
+def build_notification(hook: dict[str, Any], last_msg: str, from_label: str) -> str:
+    """通知头 + 引用化正文。头格式与旧脚本逐字节一致。"""
+    message = hook.get("message")
+    cwd = hook.get("cwd")
+    header = "# " + (message if isinstance(message, str) and message else "等待输入")
+    header += "\n\n- `" + (cwd if isinstance(cwd, str) else "") + "`"
+    header += "\n\nfrom: " + from_label
+    if last_msg:
+        return header + "\n\n" + "> " + "\n> ".join(last_msg.split("\n"))
+    return header
+
+
+def notify(hook_json: str, dry_run: bool) -> int:
+    """Notification hook 入口。返回退出码（恒 0：通知是 best-effort）。"""
+    hook: dict[str, Any] = {}
+    if hook_json.strip():
+        try:
+            parsed = json.loads(hook_json)
+            if isinstance(parsed, dict):
+                hook = parsed
+        except ValueError:
+            pass  # 非法 JSON → 基础通知（已记录差异 #2）
+    cfg = config.load_config()
+    last_msg = ""
+    tp = hook.get("transcript_path")
+    if isinstance(tp, str) and tp:
+        last_msg = transcript.extract_last_assistant(tp)
+    full = build_notification(hook, last_msg, config.effective_from_label(cfg))
+    chunks = chunk.split_notify_chunks(full, config.effective_chunk_bytes(cfg))
+    if dry_run:
+        n = len(chunks)
+        for i, c in enumerate(chunks):
+            print("=== chunk %d/%d (bytes=%d) ===" % (i + 1, n, chunk.byte_len(c)))
+            print(c)
+        print("=== end (%d chunks) ===" % n)
+        return 0
+    if not cfg.lark_uid:
+        sys.stderr.write("cc-feishu notify: 配置缺 lark_uid，跳过发送（先运行 cc-feishu install）\n")
+        return 0
+    failed = lark.send_chunks(cfg.lark_uid, chunks)
+    if failed:
+        sys.stderr.write("cc-feishu notify: %d/%d 片发送失败（不中断会话）\n" % (failed, len(chunks)))
+    return 0
+```
+
+`src/cc_feishu/cli.py` 整体替换为：
+
+```python
+"""cc-feishu 子命令分发。stdin/env 处理集中于此，notify.py 保持无 CLI 代码。"""
+
+import argparse
+import os
+import sys
+
+from cc_feishu import notify
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="cc-feishu", description="Claude Code ↔ 飞书桥")
+    sub = parser.add_subparsers(dest="command")
+
+    p_notify = sub.add_parser("notify", help="Notification hook 入口")
+    p_notify.add_argument("--dry-run", action="store_true", help="只打印分片与字节数，不发送")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "notify":
+        dry_run = args.dry_run or os.environ.get("DRY_RUN") == "1"
+        return notify.notify(sys.stdin.read(), dry_run)
+
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `pytest tests/test_notify.py -v`
+Expected: 10 PASS
+
+- [ ] **Step 5: 质量门槛 + Commit**
+
+Run: `ruff format . && ruff check . && mypy src && pytest`
+
+```bash
+git add src/cc_feishu/notify.py src/cc_feishu/cli.py tests/test_notify.py
+git commit -m "feat(notify): Notification hook 编排 + CLI 集成（T1/T5 断言迁入，DRY_RUN 行为对齐）"
+```
+
+### Task 7: install.py 注册 hook + 默认配置
+
+**Files:**
+- Create: `src/cc_feishu/install.py`
+- Modify: `src/cc_feishu/cli.py`
+- Test: `tests/test_install.py`
+
+**Interfaces:**
+- Consumes: `config.config_path()`
+- Produces:
+  - `install.old_script_path() -> Path` — `~/.local/bin/notify_feishu.sh`（调用时求值，测试可改 HOME）
+  - `install.extract_old_lark_uid(old_script: Path) -> str | None` — 正则 `^LARK_UID=(\S+)` 提取
+  - `install.default_config_text(lark_uid: str) -> str` — 注释齐全的默认 toml
+  - `install.settings_path() -> Path` — `$CLAUDE_CONFIG_DIR/settings.json`，否则 `~/.claude/settings.json`
+  - `install.patch_settings(path: Path) -> bool` — 幂等替换/新增 Notification hook，返回是否有改动
+  - `install.run_install() -> int` — 生成默认配置（不覆盖已有）+ patch settings；返回 0
+  - CLI：`cc-feishu install`
+
+- [ ] **Step 1: 写失败测试**
+
+`tests/test_install.py`（review focus #5 全覆盖）：
+
+```python
+import json
+from pathlib import Path
+
+import pytest
+
+from cc_feishu import install
+
+
+def write_settings(tmp_path: Path, data: object) -> Path:
+    p = tmp_path / "settings.json"
+    if isinstance(data, str):
+        p.write_text(data, encoding="utf-8")
+    else:
+        p.write_text(json.dumps(data), encoding="utf-8")
+    return p
+
+
+def notification_commands(p: Path) -> list[str]:
+    data = json.loads(p.read_text(encoding="utf-8"))
+    return [h["command"] for m in data["hooks"]["Notification"] for h in m["hooks"]]
+
+
+def test_extract_old_lark_uid(tmp_path: Path) -> None:
+    s = tmp_path / "notify_feishu.sh"
+    s.write_text("#!/bin/sh\nLARK_UID=ou_abc123\nCHUNK_BYTES=12000\n", encoding="utf-8")
+    assert install.extract_old_lark_uid(s) == "ou_abc123"
+    assert install.extract_old_lark_uid(tmp_path / "none.sh") is None
+    s.write_text("#!/bin/sh\n", encoding="utf-8")
+    assert install.extract_old_lark_uid(s) is None
+
+
+def test_default_config_text() -> None:
+    text = install.default_config_text("ou_x")
+    assert 'lark_uid = "ou_x"' in text
+    assert "chunk_bytes = 12000" in text
+
+
+def test_patch_settings_replaces_old_hook(tmp_path: Path) -> None:
+    p = write_settings(tmp_path, {"hooks": {"Notification": [
+        {"hooks": [{"type": "command", "command": "notify_feishu.sh"}]}]}})
+    assert install.patch_settings(p) is True
+    assert notification_commands(p) == ["cc-feishu notify"]
+
+
+def test_patch_settings_idempotent(tmp_path: Path) -> None:
+    p = write_settings(tmp_path, {"hooks": {"Notification": [
+        {"hooks": [{"type": "command", "command": "cc-feishu notify"}]}]}})
+    assert install.patch_settings(p) is False  # 已是目标状态 → 无改动
+
+
+def test_patch_settings_appends_when_absent(tmp_path: Path) -> None:
+    p = write_settings(tmp_path, {"model": "x"})
+    assert install.patch_settings(p) is True
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["model"] == "x"  # 不丢已有配置
+    assert notification_commands(p) == ["cc-feishu notify"]
+
+
+def test_patch_settings_creates_missing(tmp_path: Path) -> None:
+    p = tmp_path / "settings.json"  # 文件不存在
+    assert install.patch_settings(p) is True
+    assert notification_commands(p) == ["cc-feishu notify"]
+
+
+def test_patch_settings_malformed(tmp_path: Path) -> None:
+    p = write_settings(tmp_path, "{broken json")
+    assert install.patch_settings(p) is True
+    assert notification_commands(p) == ["cc-feishu notify"]
+
+
+def test_patch_settings_preserves_other_hooks(tmp_path: Path) -> None:
+    p = write_settings(tmp_path, {"hooks": {
+        "Notification": [
+            {"hooks": [{"type": "command", "command": "notify_feishu.sh"}]},
+            {"hooks": [{"type": "command", "command": "other-notify.sh"}]},
+        ],
+        "UserPromptSubmit": [
+            {"hooks": [{"type": "command", "command": "codegraph prompt-hook", "timeout": 300}]}],
+    }})
+    assert install.patch_settings(p) is True
+    data = json.loads(p.read_text(encoding="utf-8"))
+    notif = data["hooks"]["Notification"]
+    assert notif[0]["hooks"][0]["command"] == "cc-feishu notify"
+    assert notif[1]["hooks"][0]["command"] == "other-notify.sh"  # 其他通知 hook 保留
+    assert data["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "codegraph prompt-hook"
+
+
+def test_run_install_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    old = tmp_path / ".local" / "bin" / "notify_feishu.sh"
+    old.parent.mkdir(parents=True)
+    old.write_text("#!/bin/sh\nLARK_UID=ou_from_old\n", encoding="utf-8")
+    cfg = tmp_path / "config" / "cc-feishu" / "config.toml"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CC_FEISHU_CONFIG", str(cfg))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    assert install.run_install() == 0
+    assert 'lark_uid = "ou_from_old"' in cfg.read_text(encoding="utf-8")  # uid 迁移自旧脚本
+    sp = tmp_path / "claude" / "settings.json"
+    assert notification_commands(sp) == ["cc-feishu notify"]
+    # 幂等：改过 uid 后再装，配置不被覆盖
+    cfg.write_text('lark_uid = "ou_custom"\n', encoding="utf-8")
+    assert install.run_install() == 0
+    assert "ou_custom" in cfg.read_text(encoding="utf-8")
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `pytest tests/test_install.py -v`
+Expected: FAIL — `ImportError`
+
+- [ ] **Step 3: 写实现**
+
+`src/cc_feishu/install.py`：
+
+```python
+"""cc-feishu install：注册 Notification hook + 生成默认配置（幂等）。
+
+M2 上线 listen daemon 时再补装 systemd user unit；M1 只做 hook 与配置。
+"""
+
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+from cc_feishu import config
+
+NOTIFY_COMMAND = "cc-feishu notify"
+_UID_RE = re.compile(r"^LARK_UID=(\S+)", re.MULTILINE)
+
+
+def old_script_path() -> Path:
+    return Path.home() / ".local" / "bin" / "notify_feishu.sh"
+
+
+def extract_old_lark_uid(old_script: Path) -> str | None:
+    """从旧脚本提取 LARK_UID（M1 迁移期一次性使用）。"""
+    try:
+        text = old_script.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = _UID_RE.search(text)
+    return m.group(1) if m else None
+
+
+def default_config_text(lark_uid: str) -> str:
+    return f"""# cc-feishu 配置（cc-feishu install 生成）
+lark_uid = "{lark_uid}"      # 通知接收人
+chunk_bytes = 12000        # 单片字节预算
+from_label = ""            # 通知头 from 行标签，缺省用 hostname
+delivery = "tmux"          # 默认交付后端：tmux | queue（M2 生效）
+resume_prefix = "/go"      # resume 显式触发前缀（M3 生效）
+routing_ttl_hours = 24     # 路由表条目过期时间（M2 生效）
+"""
+
+
+def settings_path() -> Path:
+    cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    base = Path(cfg_dir) if cfg_dir else Path.home() / ".claude"
+    return base / "settings.json"
+
+
+def _atomic_write(path: Path, data: str) -> None:
+    """临时文件 + rename，写配置不可中途损坏。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    tmp.replace(path)
+
+
+def patch_settings(path: Path) -> bool:
+    """把 Notification hooks 里的 notify_feishu.sh 替换为 cc-feishu notify；没有则新增。
+
+    幂等：已是目标状态返回 False。其他 hook 一律保留。
+    """
+    data: dict[str, Any] = {}
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        data = parsed
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+        data["hooks"] = hooks
+    notif = hooks.get("Notification")
+    if not isinstance(notif, list):
+        notif = []
+        hooks["Notification"] = notif
+
+    changed = False
+    installed = False
+    for matcher in notif:
+        if not isinstance(matcher, dict):
+            continue
+        entries = matcher.get("hooks")
+        if not isinstance(entries, list):
+            continue
+        for h in entries:
+            if not isinstance(h, dict) or not isinstance(h.get("command"), str):
+                continue
+            cmd = h["command"]
+            if "notify_feishu.sh" in cmd:
+                if cmd != NOTIFY_COMMAND:
+                    h["command"] = NOTIFY_COMMAND
+                    changed = True
+                installed = True
+            elif cmd.strip() == NOTIFY_COMMAND:
+                installed = True
+    if not installed:
+        notif.append({"hooks": [{"type": "command", "command": NOTIFY_COMMAND}]})
+        changed = True
+    if changed:
+        _atomic_write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return changed
+
+
+def run_install() -> int:
+    # 1) 默认配置：不存在才生成（绝不覆盖用户已改的配置）
+    cpath = config.config_path()
+    if not cpath.exists():
+        uid = extract_old_lark_uid(old_script_path()) or ""
+        _atomic_write(cpath, default_config_text(uid))
+        if uid:
+            print(f"已生成默认配置 {cpath}（lark_uid 迁移自旧脚本）")
+        else:
+            print(f"已生成默认配置 {cpath}（未找到旧脚本，请手工填写 lark_uid）")
+    else:
+        print(f"配置已存在，跳过 {cpath}")
+
+    # 2) patch Notification hook（幂等）
+    spath = settings_path()
+    if patch_settings(spath):
+        print(f"settings.json: Notification hook 已切换为 cc-feishu notify ({spath})")
+    else:
+        print(f"settings.json: 已是 cc-feishu notify，无需改动 ({spath})")
+    return 0
+```
+
+`src/cc_feishu/cli.py`：import 行改为 `from cc_feishu import install, notify`，subparsers 增加：
+
+```python
+    sub.add_parser("install", help="注册 Notification hook 并生成默认配置（幂等）")
+```
+
+dispatch 增加：
+
+```python
+    if args.command == "install":
+        return install.run_install()
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `pytest tests/test_install.py -v`
+Expected: 9 PASS
+
+- [ ] **Step 5: 质量门槛 + Commit**
+
+Run: `ruff format . && ruff check . && mypy src && pytest`
+
+```bash
+git add src/cc_feishu/install.py src/cc_feishu/cli.py tests/test_install.py
+git commit -m "feat(install): Notification hook 注册 + 默认配置生成（幂等）"
+```
+
+### Task 8: M1 验收（逐字节比对 → 真实发送 → install → 退役旧脚本）
+
+**Files:**
+- Create: 无仓库文件（比对脚本是一次性验收工具，放 /tmp 不入库）
+- Modify: `README.md`（最后一步更新状态）
+
+**Interfaces:**
+- Consumes: 全部前序任务
+- Produces: 验收通过的可运行 `cc-feishu`；旧脚本退役；README 状态更新
+
+- [ ] **Step 1: 全量质量门槛**
+
+Run: `ruff format . && ruff check . && mypy src && pytest -q`
+Expected: 全绿。统计测试数：18 项旧断言全部有对应 pytest 断言（T1→test_chunk+test_notify，T2/T3/T4→test_chunk，T5→test_notify，T6/T7→test_transcript）。
+
+- [ ] **Step 2: pipx 安装**
+
+```bash
+pipx install --editable /home/zhongsheng/github.com/nicky-zs/cc-feishu
+cc-feishu --help && cc-feishu notify --help
+```
+
+Expected: 帮助正常输出。（仓库推送后可改 `pipx install --force git+<repo>`；editable 便于 M2 前继续开发。）
+
+- [ ] **Step 3: 新旧链路 DRY_RUN 逐字节比对**
+
+写入 `/tmp/m1-compare.sh` 并运行：
+
+```bash
+#!/bin/bash
+# M1 验收：新旧链路 DRY_RUN 输出逐字节比对（不发送消息）
+set -u
+WORK=$(mktemp -d /tmp/m1-compare.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+CFG="$WORK/config.toml"
+printf 'from_label = "10.123.179.32"\n' > "$CFG"  # 对齐旧脚本硬编码 IP（已记录差异 #1）
+
+python3 - "$WORK" <<'PY'
+import json, sys
+from pathlib import Path
+w = Path(sys.argv[1])
+def jsonl(name, entries):
+    (w / name).write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in entries) + "\n", encoding="utf-8")
+def asst(t):
+    return {"type": "assistant", "isSidechain": False, "message": {"content": [{"type": "text", "text": t}]}}
+def ask(question, header, options, multi=False):
+    return {"type": "assistant", "isSidechain": False, "message": {"content": [
+        {"type": "tool_use", "id": "c", "name": "AskUserQuestion",
+         "input": {"questions": [{"question": question, "header": header, "multiSelect": multi, "options": options}]}}]}}
+
+jsonl("t1.jsonl", [asst("你好，这是一条短消息，含代码：\n\n```python\nprint(1)\n```\n")])
+lines = []
+for i in range(500):
+    lines.append(f"第{i:04d}行：" + "汉字内容测试" * 4)
+    if i % 5 == 4:
+        lines.append("")
+jsonl("t2.jsonl", [asst("\n".join(lines))])
+code = [f"def fn_{i}(): return {i}  # " + "x" * 50 for i in range(500)]
+jsonl("t3.jsonl", [asst("代码前说明\n\n```python\n" + "\n".join(code) + "\n```\n\n代码后说明")])
+jsonl("t4.jsonl", [asst("汉" * 15000)])
+jsonl("t6.jsonl", [asst("问题前的铺垫说明文字。"),
+    ask("选哪个方案？", "形态路线", [{"label": "B：独立项目（推荐）", "description": "pipx 装 CLI + install.sh"},
+                                    {"label": "先小重构缓建仓", "description": "单文件 Python"}])])
+jsonl("t7.jsonl", [asst("上一轮的陈旧文本。"),
+    {"type": "user", "message": {"content": [{"type": "tool_result", "content": "ok"}]}},
+    asst("本轮的说明文字。"),
+    ask("T7 的问题？", "测试", [{"label": "选项一", "description": ""}])])
+PY
+
+pass=0; fail=0
+check() { # $1 名字  $2 hook JSON  $3 可选额外 env（如 FEISHU_CHUNK_BYTES=3000）
+  local name="$1" hook="$2" extra="${3:-}"
+  printf '%s' "$hook" | env $extra DRY_RUN=1 "$HOME/.local/bin/notify_feishu.sh" > "$WORK/old.out" 2>/dev/null
+  printf '%s' "$hook" | env $extra DRY_RUN=1 CC_FEISHU_CONFIG="$CFG" cc-feishu notify > "$WORK/new.out" 2>/dev/null
+  if cmp -s "$WORK/old.out" "$WORK/new.out"; then
+    pass=$((pass+1)); echo "PASS $name"
+  else
+    fail=$((fail+1)); echo "FAIL $name"; diff "$WORK/old.out" "$WORK/new.out" | head -10
+  fi
+}
+
+for t in t1 t2 t3 t4 t6 t7; do
+  check "$t" "$(printf '{"transcript_path":"%s/%s.jsonl","message":"test notify","cwd":"/tmp/wd"}' "$WORK" "$t")"
+done
+check "no-transcript" '{"message":"test notify","cwd":"/tmp/wd"}'
+check "small-budget" "$(printf '{"transcript_path":"%s/t2.jsonl","message":"test notify","cwd":"/tmp/wd"}' "$WORK")" "FEISHU_CHUNK_BYTES=3000"
+for tp in $(ls -t ~/.claude/projects/*/*.jsonl 2>/dev/null | head -3); do
+  check "real:$(basename "$tp" .jsonl)" "$(printf '{"transcript_path":"%s","message":"test notify","cwd":"/tmp/wd"}' "$tp")"
+done
+echo; echo "结果: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]
+```
+
+Run: `bash /tmp/m1-compare.sh`
+Expected: 全部 PASS（含 3 个真实 transcript）。任何 FAIL → 用 diff 定位语义偏差，回到对应任务修正后重跑；**比对通过是 M1 验收的硬门槛**。
+
+- [ ] **Step 4: 旧 bash 套件再跑一遍（退役前留档）**
+
+Run: `bash ~/ai_works/notify_feishu_tests/run.sh`
+Expected: `18 passed, 0 failed`（确认旧链路在比对时刻行为基线仍成立）。
+
+- [ ] **Step 5: cc-feishu install 切换 hook**
+
+```bash
+cp ~/.claude/settings.json /tmp/settings.json.m1bak
+cc-feishu install
+diff /tmp/settings.json.m1bak ~/.claude/settings.json || true
+cat ~/.config/cc-feishu/config.toml
+printf '{"message":"安装后自检","cwd":"/tmp"}' | cc-feishu notify --dry-run
+```
+
+Expected: diff 仅 Notification hook 行变化（notify_feishu.sh → cc-feishu notify）；config.toml 含从旧脚本迁移的 `lark_uid`；自检输出单片通知。
+
+- [ ] **Step 6: 真实发送验收（需用户在场确认）**
+
+```bash
+tp=$(ls -t ~/.claude/projects/*/*.jsonl | head -1)
+printf '{"transcript_path":"%s","message":"M1 验收：新链路真实发送","cwd":"/tmp"}' "$tp" | cc-feishu notify
+```
+
+→ 请用户确认飞书收到通知（含正文）。**未确认前不得进入 Step 7。**
+
+- [ ] **Step 7: 旧脚本退役（用户确认后执行）**
+
+设计 §9：M1 验收后删除旧脚本与旧测试目录。
+
+```bash
+rm ~/.local/bin/notify_feishu.sh
+rm -rf ~/ai_works/notify_feishu_tests
+```
+
+README.md 状态行改为：
+
+```markdown
+状态：M1 完成（通知链路已迁移，旧 notify_feishu.sh 已退役）。M2（listen + 路由表 + tmux 后端）待启动。
+```
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add README.md
+git commit -m "chore: M1 验收完成（DRY_RUN 逐字节比对通过 + 真实发送确认），旧脚本退役"
+```
+
+---
+
+## 自检记录（Self-Review）
+
+1. **Spec 覆盖**：设计 §3 骨架（M1 范围模块全部落位；listen/state/deliver 属 M2/M3 明确不做）、§4 notify 子命令 + 配置键 + 提取规则 + 分片规则、§6 测试策略（纯函数单测/dry-run/无真实发送的 mock）、§7 pipx 分发、§8 M1 验收标准（逐字节一致 + 用户确认）、§9 退役——均有对应任务。install 的 systemd unit 部分按里程碑归属推迟到 M2（设计 §4 表格与 §8 里程碑一致以里程碑为准）。
+2. **占位符扫描**：已清除全部"实现时再改"注记与笔误示例；所有代码块可直接落地。
+3. **类型一致性**：`split_notify_chunks`/`byte_len`（Task 2 定义，Task 6 消费）、`extract_last_assistant`（Task 3 定义，Task 6 消费）、`Config`/`load_config`/`effective_*`（Task 4 定义，Task 6 消费）、`send_chunks`（Task 5 定义，Task 6 经 `notify.lark.send_chunks` 消费）、`patch_settings`/`run_install`（Task 7 定义，CLI 消费）——签名已逐一核对。
+4. **Review Focus**：五条 + 两条补充均有具名测试。
+5. **计划内代码已实证**（2026-10-15，计划编写时对拍）：Task 2 的 chunk 代码与旧脚本 heredoc python 逐字节对拍 16 组（8 文本 × 2 预算）全一致；Task 3 的 transcript 代码与旧 jq 链路（含 `tail -n 100` 与 `$(...)` 尾部换行剥离口径）对拍 20 组全一致（15 构造场景 + 5 个真实 transcript）。对拍中发现并修复一处计划 bug：jq 输出经 `$(...)` 会剥掉全部尾部换行，`extract_last_assistant` 必须 `rstrip("\n")` 才能逐字节对齐——已写入实现与注释。
