@@ -15,9 +15,7 @@ from cc_feishu import config
 
 NOTIFY_COMMAND = "cc-feishu notify"
 # 依次尝试：LARK_UID= 优先（裸 UID= 可能是 shell 数字 uid 等无关赋值）
-_UID_RES = tuple(
-    re.compile(rf"^{name}=(\S+)", re.MULTILINE) for name in ("LARK_UID", "UID")
-)
+_UID_RES = tuple(re.compile(rf"^{name}=(\S+)", re.MULTILINE) for name in ("LARK_UID", "UID"))
 _OPEN_ID_RE = re.compile(r"ou_\w+")
 
 
